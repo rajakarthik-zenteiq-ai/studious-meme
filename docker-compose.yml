@@ -1,0 +1,157 @@
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+    environment:
+      - MONGO_INITDB_ROOT_USERNAME=${MONGO_ROOT_USER:-admin}
+      - MONGO_INITDB_ROOT_PASSWORD=${MONGO_ROOT_PASS:-password}
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  etcd:
+    image: quay.io/coreos/etcd:v3.5.11
+    container_name: milvus-etcd
+    environment:
+      - ETCD_AUTO_COMPACTION_MODE=revision
+      - ETCD_AUTO_COMPACTION_RETENTION=1000
+      - ETCD_QUOTA_BACKEND_BYTES=4294967296
+      - ETCD_SNAPSHOT_COUNT=50000
+    volumes:
+      - etcd_data:/etcd
+    command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
+
+  minio:
+    image: minio/minio:latest
+    container_name: milvus-minio
+    environment:
+      - MINIO_ACCESS_KEY=minioadmin
+      - MINIO_SECRET_KEY=minioadmin
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+
+  milvus:
+    image: milvusdb/milvus:v2.3.4
+    container_name: milvus
+    depends_on:
+      - etcd
+      - minio
+    environment:
+      - ETCD_ENDPOINTS=etcd:2379
+      - MINIO_ADDRESS=minio:9000
+      - COMMON_STORAGETYPE=local
+    ports:
+      - "19530:19530"
+      - "9091:9091"
+    volumes:
+      - milvus_data:/var/lib/milvus
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9091/healthz"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    command: ["milvus", "run", "standalone"]
+
+  redis:
+    image: redis:7
+    container_name: redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+
+  # ── MCP Server Services ────────────────────────────────────────────
+  mongo_server:
+    build: 
+      context: ./mcp_servers/mongo_server
+      dockerfile: Dockerfile
+    container_name: mongo_server
+    ports:
+      - "8101:8101"
+    environment:
+      - IS_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - MONGO_URI=mongodb://admin:password@mongo:27017
+      - MONGO_DB=logsdb
+      - MONGO_MAX_POOL_SIZE=${MONGO_MAX_POOL_SIZE:-10}
+      - MONGO_MIN_POOL_SIZE=${MONGO_MIN_POOL_SIZE:-1}
+      - DEBUG=${DEBUG:-true}
+    depends_on:
+      mongo:
+        condition: service_healthy
+    restart: unless-stopped
+
+  milvus_server:
+    build:
+      context: ./mcp_servers/milvus_server
+      dockerfile: Dockerfile
+    container_name: milvus_server
+    ports:
+      - "8102:8102"
+    environment:
+      - IS_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - MILVUS_HOST=milvus
+      - MILVUS_PORT=19530
+      - MILVUS_COLLECTION=${MILVUS_COLLECTION:-logs_embeddings}
+      - DEBUG=${DEBUG:-true}
+    depends_on:
+      milvus:
+        condition: service_healthy
+    restart: unless-stopped
+
+  websearch_server:
+    build:
+      context: ./mcp_servers/websearch_server
+      dockerfile: Dockerfile
+    container_name: websearch_server
+    ports:
+      - "8105:8105"
+    environment:
+      - IS_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SEARCH_MODEL=${SEARCH_MODEL:-gpt-4o-mini}
+      - DEBUG=${DEBUG:-true}
+    restart: unless-stopped
+
+  scirex_server:
+    build:
+      context: .
+      dockerfile: mcp_servers/scirex_server/Dockerfile
+    container_name: scirex_server
+    ports:
+      - "8106:8106"
+    environment:
+      - IS_DOCKER=true
+      - PYTHONUNBUFFERED=1
+      - SCIREX_DATA_DIR=/data/user_datasets
+      - SCIREX_MODEL_DIR=/data/user_models
+      - DEBUG=${DEBUG:-true}
+    volumes:
+      - scirex_data:/data
+    restart: unless-stopped
+
+volumes:
+  mongo_data:
+  redis_data:
+  etcd_data:
+  minio_data:
+  milvus_data:
+  neo4j_data:
+  neo4j_logs:
+  scirex_data:
+
+networks:
+  default:
+    name: mcp_network

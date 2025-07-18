@@ -1,0 +1,111 @@
+# Git
+.git
+.gitignore
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+build
+develop-eggs
+dist
+downloads
+eggs
+.eggs
+lib
+lib64
+parts
+sdist
+var
+wheels
+*.egg-info
+.installed.cfg
+*.egg
+
+# Virtual environments
+env
+venv
+ENV
+env.bak
+venv.bak
+.venv
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Documentation
+docs/_build
+*.md
+
+# Tests
+.pytest_cache
+.coverage
+htmlcov
+
+# Development
+.env
+.env.local
+.env.development
+.env.test
+.env.production
+
+# MCP
+uv.lock
+user_datasets/
+user_models/
+health_check_report.json
+test_output/
+
+# Inspector build
+inspector/dist/
+inspector/node_modules/
+
+# Ignore production config
+config/local_settings.py
+
+# Ignore structured logs
+*.jsonl
+
+# Docker build cache
+docker-cache/
+
+# Ignore logs
+logs/
+*.log
+
+# Backup files and temporary files
+*.bak
+*.tmp
+*_backup.py
+*_backup_*.py
+*_old_backup_*.py
+*_new_backup_*.py
+server_backup.py
+server_old_backup_*.py
+server_new_backup_*.py
+
+# Process ID files
+*.pid
+
+# Virtual environment directories
+venv/
+.venv/
+
+# Cache directories
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# SciREX large directories (exclude from Docker build)
+mcp_servers/scirex_server/SciREX/examples/
+mcp_servers/scirex_server/SciREX/docs/

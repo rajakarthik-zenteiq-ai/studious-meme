@@ -1,0 +1,19 @@
+# FastMCP and MCP dependencies
+fastmcp==2.10.5
+mcp>=1.0.0
+
+# OpenAI integration
+openai>=1.0.0
+
+# Pydantic with timezone support
+pydantic>=2.0.0
+
+# Web framework
+uvicorn>=0.20.0
+fastapi>=0.100.0
+
+# HTTP client (for future use if needed)
+httpx>=0.24.0
+
+# Logging and utilities
+python-dotenv>=1.0.0
