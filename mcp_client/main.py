@@ -1,44 +1,87 @@
-# mcp_client/main.py
-
-import sys
-import json
+#!/usr/bin/env python3
+"""
+Interactive MCP Client CLI
+"""
 import asyncio
-import logging
+import json
+import sys
+from pathlib import Path
 
-from .client import MCPLogAnalyticsClient
-from .workflows import Workflows
+# Add project root to path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-logging.basicConfig(format="%(asctime)s %(levelname)s %(message)s", level=logging.INFO)
-logger = logging.getLogger(__name__)
+from mcp_client.client import create_mcp_client
 
-async def interactive_mode(wf: Workflows):
-    print("🚀 Interactive MCP Log Analytics CLI")
-    print("Type 'quit' to exit.")
-    while True:
-        query = input("Query> ").strip()
-        if not query or query.lower() in ("quit", "exit"):
-            break
-        try:
-            response = await wf.process_query(query)
-            print(json.dumps(response, indent=2, ensure_ascii=False))
-        except Exception as e:
-            logger.exception("Error processing query")
+async def interactive_mode():
+    """Run interactive CLI mode"""
+    print("🚀 MCP Log Analytics Interactive CLI")
+    print("=" * 50)
+    
+    client = await create_mcp_client()
+    
+    try:
+        # Health check on startup
+        health = await client.health_check()
+        print("📊 Server Status:")
+        for server, status in health.items():
+            icon = "✅" if status["status"] == "healthy" else "❌"
+            print(f"  {icon} {server}: {status['status']}")
+        print()
+        
+        print("Type 'quit' to exit, 'help' for commands")
+        
+        while True:
+            query = input("\nQuery> ").strip()
+            
+            if not query:
+                continue
+                
+            if query.lower() in ["quit", "exit", "q"]:
+                break
+                
+            if query.lower() == "help":
+                print("""
+Available commands:
+- quit/exit/q: Exit the program
+- health: Check server health
+- Any other text: Process as query
+                """)
+                continue
+                
+            if query.lower() == "health":
+                health = await client.health_check()
+                print(json.dumps(health, indent=2))
+                continue
+            
+            try:
+                print("\n🤖 Processing...")
+                response = await client.process_query(query)
+                print("\n" + "=" * 50)
+                print("Response:")
+                print(response)
+                print("=" * 50)
+                
+            except Exception as e:
+                print(f"\n❌ Error: {e}")
+                
+    finally:
+        await client.cleanup()
+        print("\n👋 Goodbye!")
 
 async def main():
-    client = MCPLogAnalyticsClient()
-    await client.connect()
-    wf = Workflows(client)
-
+    """Main entry point"""
     if len(sys.argv) > 1:
-        # Single-shot mode
-        query = " ".join(sys.argv[1:])
-        result = await wf.process_query(query)
-        print(json.dumps(result, indent=2, ensure_ascii=False))
+        # Single query mode
+        client = await create_mcp_client()
+        try:
+            query = " ".join(sys.argv[1:])
+            response = await client.process_query(query)
+            print(response)
+        finally:
+            await client.cleanup()
     else:
-        # Interactive shell
-        await interactive_mode(wf)
-
-    await client.close()
+        # Interactive mode
+        await interactive_mode()
 
 if __name__ == "__main__":
     asyncio.run(main())
