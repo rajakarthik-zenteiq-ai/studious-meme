@@ -1,12 +1,11 @@
 import streamlit as st
 import asyncio
 import base64
-import nest_asyncio
+import threading
+import concurrent.futures
+from concurrent.futures import Future
 from agent.agent import LogAnalyticsAgent
 from mcp_client.client import MCPLogAnalyticsClient
-
-# Enable nested asyncio loops
-nest_asyncio.apply()
 
 st.set_page_config(page_title="MCP Log Analytics Agent", page_icon="🤖", layout="wide")
 st.title("🤖 MCP Log Analytics Agent UI")
@@ -15,48 +14,76 @@ st.title("🤖 MCP Log Analytics Agent UI")
 if "messages" not in st.session_state:
     st.session_state["messages"] = []
 
-# Async runner for Streamlit with proper event loop handling
-def run_async(coro):
-    try:
-        # Use current event loop if available, otherwise create new one
-        loop = None
+# Global event loop and executor
+@st.cache_resource
+def get_event_loop_executor():
+    """Create a dedicated thread with event loop for async operations"""
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    loop_future = executor.submit(_create_event_loop)
+    loop = loop_future.result()  # Wait for loop to be created
+    return executor, loop
+
+def _create_event_loop():
+    """Create and return a new event loop in a thread"""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Keep the loop running in the background
+    def run_forever():
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            pass
-        
-        if loop is None:
-            return asyncio.run(coro)
-        else:
-            # We're in an existing event loop, use nest_asyncio
-            task = asyncio.create_task(coro)
-            return loop.run_until_complete(task)
+            loop.run_forever()
+        except Exception as e:
+            st.error(f"Event loop error: {e}")
+    
+    thread = threading.Thread(target=run_forever, daemon=True)
+    thread.start()
+    return loop
+
+# Get the persistent executor and loop
+executor, event_loop = get_event_loop_executor()
+
+def run_async(coro):
+    """Run coroutine in the dedicated event loop"""
+    try:
+        # Submit the coroutine to our dedicated event loop
+        future = asyncio.run_coroutine_threadsafe(coro, event_loop)
+        return future.result(timeout=60)  # 60 second timeout
+    except concurrent.futures.TimeoutError:
+        st.error("Request timed out after 60 seconds")
+        raise
     except Exception as e:
         st.error(f"Async execution error: {e}")
         raise
 
-# Initialize agent and client in session state to ensure they're created in correct event loop
-async def initialize_services():
-    """Initialize agent and client in the current event loop"""
-    if "client_initialized" not in st.session_state:
-        client = MCPLogAnalyticsClient()
-        await client.initialize()
-        st.session_state["client"] = client
-        st.session_state["client_initialized"] = True
-    
-    if "agent_initialized" not in st.session_state:
-        agent = LogAnalyticsAgent()
-        await agent.initialize()
-        st.session_state["agent"] = agent
-        st.session_state["agent_initialized"] = True
-    
-    return st.session_state["client"], st.session_state["agent"]
+# Initialize agent and client with proper event loop isolation
+@st.cache_resource
+def initialize_services():
+    """Initialize agent and client in the dedicated event loop"""
+    try:
+        async def _init():
+            client = MCPLogAnalyticsClient()
+            await client.initialize()
+            
+            agent = LogAnalyticsAgent()
+            await agent.initialize()
+            
+            return client, agent
+        
+        # Run initialization in our dedicated event loop
+        client, agent = run_async(_init())
+        return client, agent
+        
+    except Exception as e:
+        st.error(f"Failed to initialize services: {e}")
+        st.error("Please check that MCP servers are running.")
+        raise
 
 # Initialize services
 try:
-    client, agent = run_async(initialize_services())
+    client, agent = initialize_services()
+    st.success("✅ MCP services initialized successfully!")
 except Exception as e:
-    st.error(f"Failed to initialize services: {e}")
+    st.error(f"❌ Failed to initialize services: {e}")
     st.error("Please check that MCP servers are running.")
     st.stop()
 
@@ -89,7 +116,7 @@ if submit and user_input:
     st.session_state["messages"].append({"role": "user", "content": user_input})
     with st.spinner("Agent is thinking..."):
         try:
-            # Call the agent with proper error handling
+            # Process query in the dedicated event loop
             response = run_async(agent.analyze(
                 query=user_input,
                 user_id="demo_user",
@@ -97,8 +124,10 @@ if submit and user_input:
                 attachments=attachments
             ))
             st.session_state["messages"].append({"role": "agent", "content": response})
+            st.success("✅ Query processed successfully!")
         except Exception as e:
-            st.error(f"Error processing query: {e}")
+            error_msg = f"Error processing query: {str(e)}"
+            st.error(f"❌ {error_msg}")
             st.session_state["messages"].append({
                 "role": "agent", 
                 "content": f"Sorry, I encountered an error: {str(e)}"

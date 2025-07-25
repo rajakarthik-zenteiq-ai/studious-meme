@@ -28,7 +28,7 @@ class MemoryManager:
     """
     Manages conversation memory with Redis caching and MongoDB persistence
     Features:
-    - Short-term sliding window (last 4 conversations)
+    - Short-term sliding window (last 8 conversations)
     - Auto-summarization every 5 conversations
     - Long-term memory extraction every 7-8 conversations
     - 5-minute TTL with automatic refresh
@@ -51,7 +51,7 @@ class MemoryManager:
         logger.info(f"Redis URL: {self.redis_url}")
         
         # Memory settings
-        self.sliding_window_size = 4
+        self.sliding_window_size = 8
         self.summarization_interval = 5
         self.long_term_interval = 7
         self.cache_ttl = 300  # 5 minutes

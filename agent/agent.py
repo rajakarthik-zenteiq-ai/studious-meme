@@ -20,7 +20,6 @@ from langchain_core.callbacks import AsyncCallbackHandler
 # LangGraph imports
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
-from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.sqlite import SqliteSaver
 
 # Local imports
@@ -31,62 +30,6 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from mcp_client.client import MCPLogAnalyticsClient
 from agent.llm_providers import LLMProviderFactory, LLMProvider
 from agent.memory_manager import MemoryManager
-from pydantic import BaseModel
-
-# Define argument schemas for tools
-class StoreLogsArgs(BaseModel):
-    log_entry: str
-
-class SearchLogsArgs(BaseModel):
-    query: str
-    start_date: Optional[str] = None
-    end_date: Optional[str] = None
-    level: Optional[str] = None
-
-class UploadDatasetArgs(BaseModel):
-    user_id: str
-    filename: str
-    content_base64: str
-
-class FindSimilarLogsArgs(BaseModel):
-    query: str
-    limit: Optional[int] = 10
-
-class ClusterLogsArgs(BaseModel):
-    query: Optional[str] = None
-    n_clusters: Optional[int] = 5
-
-class TrainNeuralNetworkArgs(BaseModel):
-    dataset_id: str
-    model_type: str = "neural_network"
-
-class PerformClusteringArgs(BaseModel):
-    dataset_id: str
-    algorithm: str = "kmeans"
-    n_clusters: int = 5
-
-class WebSearchArgs(BaseModel):
-    query: str
-    max_results: Optional[int] = 5
-
-class SummarizeTextArgs(BaseModel):
-    text: str
-    max_length: Optional[int] = 200
-
-class AddKnowledgeArgs(BaseModel):
-    entity: str
-    relationship: str
-    target: str
-
-class QueryKnowledgeArgs(BaseModel):
-    query: str
-    limit: Optional[int] = 10
-
-class StoreFileArgs(BaseModel):
-    user_id: str
-    filename: str
-    content: bytes
-    metadata: Optional[Dict[str, Any]] = None
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -155,14 +98,17 @@ class LogAnalyticsAgent:
         # Memory manager
         self.memory_manager = MemoryManager()
         
-        # Tools
-        self.tools = []
+        # Available tools from MCP servers
+        self.available_tools = {}
         
         # Memory for state persistence - using None for now to avoid context manager issues
         self.memory = None
         
         # Graph
         self.graph = None
+        
+        # Add asyncio lock to prevent concurrent execution issues
+        self._analysis_lock = asyncio.Lock()
         
         # Categories for direct response
         self.direct_response_categories = [
@@ -185,8 +131,8 @@ class LogAnalyticsAgent:
             # Initialize memory manager
             await self.memory_manager.initialize()
             
-            # Create tools
-            await self._create_tools()
+            # Discover available tools from MCP servers
+            await self._discover_mcp_tools()
             
             # Build graph
             self._build_graph()
@@ -197,152 +143,45 @@ class LogAnalyticsAgent:
             logger.error(f"Failed to initialize agent: {e}")
             raise
     
-    async def _create_tools(self):
-        """Create tools from MCP servers"""
-        self.tools = []
+    async def _discover_mcp_tools(self):
+        """Discover available tools from MCP servers dynamically"""
+        self.available_tools = {}
         
         if not self.mcp_client:
-            logger.warning("MCP client not initialized, skipping tool creation")
+            logger.warning("MCP client not initialized, skipping tool discovery")
             return
         
-        # MongoDB tools
-        mongo_tools = []
-        if hasattr(self.mcp_client, 'store_logs'):
-            mongo_tools.append(
-                self._create_tool(
-                    name="store_logs",
-                    description="Store log entries in MongoDB",
-                    func=self.mcp_client.store_logs,
-                    args_schema=StoreLogsArgs
-                )
-            )
-        
-        if hasattr(self.mcp_client, 'get_logs_by_date'):
-            mongo_tools.append(
-                self._create_tool(
-                    name="search_logs",
-                    description="Search logs by date, level, or pattern",
-                    func=self.mcp_client.get_logs_by_date,
-                    args_schema=SearchLogsArgs
-                )
-            )
-        
-        if hasattr(self.mcp_client, 'upload_dataset'):
-            mongo_tools.append(
-                self._create_tool(
-                    name="upload_dataset",
-                    description="Upload and store a dataset for analysis",
-                    func=self.mcp_client.upload_dataset,
-                    args_schema=UploadDatasetArgs
-                )
-            )
-        
-        # Vector search tools
-        vector_tools = []
-        if hasattr(self.mcp_client, 'find_similar_logs'):
-            vector_tools.append(
-                self._create_tool(
-                    name="find_similar_logs",
-                    description="Find logs similar to a query using vector search",
-                    func=self.mcp_client.find_similar_logs,
-                    args_schema=FindSimilarLogsArgs
-                )
-            )
-        
-        if hasattr(self.mcp_client, 'cluster_logs'):
-            vector_tools.append(
-                self._create_tool(
-                    name="cluster_logs",
-                    description="Cluster logs to find patterns",
-                    func=self.mcp_client.cluster_logs,
-                    args_schema=ClusterLogsArgs
-                )
-            )
-        
-        # ML/Scientific tools
-        ml_tools = []
-        if hasattr(self.mcp_client, 'train_neural_network'):
-            ml_tools.append(
-                self._create_tool(
-                    name="train_neural_network",
-                    description="Train a neural network on uploaded dataset",
-                    func=self.mcp_client.train_neural_network,
-                    args_schema=TrainNeuralNetworkArgs
-                )
-            )
-        
-        if hasattr(self.mcp_client, 'perform_clustering'):
-            ml_tools.append(
-                self._create_tool(
-                    name="perform_clustering",
-                    description="Perform clustering analysis on data",
-                    func=self.mcp_client.perform_clustering,
-                    args_schema=PerformClusteringArgs
-                )
-            )
-        
-        # Web search tools
-        web_tools = []
-        if hasattr(self.mcp_client, 'web_search'):
-            web_tools.append(
-                self._create_tool(
-                    name="web_search",
-                    description="Search the web for information",
-                    func=self.mcp_client.web_search,
-                    args_schema=WebSearchArgs
-                )
-            )
-        
-        if hasattr(self.mcp_client, 'summarize_text'):
-            web_tools.append(
-                self._create_tool(
-                    name="summarize_text",
-                    description="Summarize text content",
-                    func=self.mcp_client.summarize_text,
-                    args_schema=SummarizeTextArgs
-                )
-            )
-        
-        # Knowledge graph tools (only if methods exist)
-        graph_tools = []
-        if hasattr(self.mcp_client, 'add_to_knowledge_graph'):
-            graph_tools.append(
-                self._create_tool(
-                    name="add_knowledge",
-                    description="Add knowledge to the graph",
-                    func=self.mcp_client.add_to_knowledge_graph,
-                    args_schema=AddKnowledgeArgs
-                )
-            )
-        
-        if hasattr(self.mcp_client, 'query_knowledge_graph'):
-            graph_tools.append(
-                self._create_tool(
-                    name="query_knowledge",
-                    description="Query the knowledge graph",
-                    func=self.mcp_client.query_knowledge_graph,
-                    args_schema=QueryKnowledgeArgs
-                )
-            )
-        
-        self.tools.extend(mongo_tools)
-        self.tools.extend(vector_tools)
-        self.tools.extend(ml_tools)
-        self.tools.extend(web_tools)
-        self.tools.extend(graph_tools)
-        
-        logger.info(f"Created {len(self.tools)} tools")
+        # Get server status and available tools
+        try:
+            server_status = await self.mcp_client.get_server_status()
+            for server_id, server_info in server_status.items():
+                if server_info.get("connected", False):
+                    tools = server_info.get("tools", [])
+                    for tool_name in tools:
+                        self.available_tools[tool_name] = {
+                            "server": server_id,
+                            "description": f"{tool_name} on {server_info['name']}"
+                        }
+            
+            logger.info(f"Discovered {len(self.available_tools)} tools from {len(server_status)} MCP servers")
+            
+        except Exception as e:
+            logger.error(f"Failed to discover MCP tools: {e}")
+            self.available_tools = {}
     
-    def _create_tool(self, name: str, description: str, func, args_schema) -> BaseTool:
-        """Create a LangChain tool from a function"""
-        from langchain_core.tools import StructuredTool
+    async def _execute_mcp_tool(self, tool_name: str, **kwargs) -> Dict[str, Any]:
+        """Execute an MCP tool via the client"""
+        if tool_name not in self.available_tools:
+            return {"error": f"Tool {tool_name} not available"}
         
-        return StructuredTool.from_function(
-            name=name,
-            description=description,
-            coroutine=func,  # Use coroutine parameter for async functions
-            args_schema=args_schema
-        )
+        server_id = self.available_tools[tool_name]["server"]
+        
+        try:
+            result = await self.mcp_client._call_tool(server_id, tool_name, **kwargs)
+            return result
+        except Exception as e:
+            logger.error(f"Error executing tool {tool_name}: {e}")
+            return {"error": f"Tool execution failed: {str(e)}"}
     
     def _build_graph(self):
         """Build the enhanced LangGraph workflow with direct response"""
@@ -354,7 +193,7 @@ class LogAnalyticsAgent:
         workflow.add_node("response_classifier", self._response_classifier_node)
         workflow.add_node("direct_response", self._direct_response_node)
         workflow.add_node("agent_with_tools", self._agent_with_tools_node)
-        workflow.add_node("tools", ToolNode(self.tools))
+        workflow.add_node("tools", self._tools_node)
         
         # Set entry point
         workflow.set_entry_point("context_enrichment")
@@ -582,8 +421,27 @@ If a dataset or file was uploaded, acknowledge it and offer relevant analysis op
             MessagesPlaceholder(variable_name="messages")
         ])
         
-        # Bind tools to LLM
-        llm_with_tools = self.llm.bind_tools(self.tools)
+        # Create tool schemas for LLM binding
+        tool_schemas = []
+        for tool_name, tool_info in self.available_tools.items():
+            tool_schemas.append({
+                "type": "function",
+                "function": {
+                    "name": tool_name,
+                    "description": tool_info["description"],
+                    "parameters": {
+                        "type": "object",
+                        "properties": {},  # Basic schema - could be enhanced
+                        "additionalProperties": True
+                    }
+                }
+            })
+        
+        # Bind tools to LLM if available
+        if tool_schemas:
+            llm_with_tools = self.llm.bind_tools(tool_schemas)
+        else:
+            llm_with_tools = self.llm
         
         # Use streaming if callback is provided
         if state.get("stream_callback"):
@@ -593,6 +451,32 @@ If a dataset or file was uploaded, acknowledge it and offer relevant analysis op
         response = await llm_with_tools.ainvoke(messages)
         
         return {"messages": [response]}
+    
+    async def _tools_node(self, state: AgentState) -> Dict[str, Any]:
+        """Execute tools called by the agent"""
+        messages = state["messages"]
+        last_message = messages[-1]
+        
+        tool_results = []
+        
+        # Check if the message has tool calls
+        if hasattr(last_message, "tool_calls") and last_message.tool_calls:
+            for tool_call in last_message.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call.get("args", {})
+                
+                # Execute the tool via MCP client
+                result = await self._execute_mcp_tool(tool_name, **tool_args)
+                
+                # Create tool message
+                from langchain_core.messages import ToolMessage
+                tool_message = ToolMessage(
+                    content=json.dumps(result, indent=2),
+                    tool_call_id=tool_call["id"]
+                )
+                tool_results.append(tool_message)
+        
+        return {"messages": tool_results}
     
     def _should_continue(self, state: AgentState) -> str:
         """Determine if we should continue to tools or end"""
@@ -702,8 +586,7 @@ If a dataset or file was uploaded, acknowledge it and offer relevant analysis op
         self.llm = self.llm_factory.get_llm(provider)
         logger.info(f"Switched to LLM provider: {provider}")
         
-        # Rebuild tools with new LLM if needed
-        await self._create_tools()
+        # Rebuild graph with new LLM
         self._build_graph()
     
     async def analyze_stream(
@@ -766,61 +649,62 @@ If a dataset or file was uploaded, acknowledge it and offer relevant analysis op
         attachments: Optional[List[Dict]] = None
     ) -> str:
         """Analyze a query with optional attachments (non-streaming)"""
-        if not self.graph:
-            await self.initialize()
-        
-        try:
-            # Create initial state
-            initial_state = AgentState(
-                messages=[HumanMessage(content=query)],
-                user_id=user_id,
-                conversation_id=conversation_id,
-                attachments=attachments or [],
-                dataset_id=None,
-                file_id=None,
-                current_task=None,
-                errors=[],
-                context={},
-                llm_provider=self.llm_provider,
-                stream_callback=None,
-                memory_context=None,
-                use_tools=True,
-                response_mode=""
-            )
-            
-            # Run the graph with recursion limit
-            config = {
-                "configurable": {"thread_id": f"{user_id}:{conversation_id}"},
-                "recursion_limit": 50  # Increase recursion limit
-            }
-            result = await self.graph.ainvoke(initial_state, config=config)
-            
-            # Extract the final response
-            final_message = result["messages"][-1]
-            
-            # Update memory with final response
+        async with self._analysis_lock:  # Prevent concurrent execution
+            if not self.graph:
+                await self.initialize()
+
             try:
-                if isinstance(final_message.content, list):
-                    content = " ".join([str(item) for item in final_message.content])
-                elif isinstance(final_message.content, str):
-                    content = final_message.content
-                else:
-                    content = str(final_message.content)
-                await self._update_memory(result, content)
-            except Exception as e:
-                logger.warning(f"Failed to update memory: {e}")
-            
-            # Handle errors
-            if result.get("errors"):
-                logger.warning(f"Errors during execution: {result['errors']}")
-                error_msg = "\n\nNote: " + "\n".join(result['errors'])
-                return final_message.content + error_msg
+                # Create initial state
+                initial_state = AgentState(
+                    messages=[HumanMessage(content=query)],
+                    user_id=user_id,
+                    conversation_id=conversation_id,
+                    attachments=attachments or [],
+                    dataset_id=None,
+                    file_id=None,
+                    current_task=None,
+                    errors=[],
+                    context={},
+                    llm_provider=self.llm_provider,
+                    stream_callback=None,
+                    memory_context=None,
+                    use_tools=True,
+                    response_mode=""
+                )
                 
-            return final_message.content
-            
-        except Exception as e:
-            logger.error(f"Error in analysis: {e}")
-            return f"I encountered an error while processing your request: {str(e)}"
+                # Run the graph with recursion limit
+                config = {
+                    "configurable": {"thread_id": f"{user_id}:{conversation_id}"},
+                    "recursion_limit": 50  # Increase recursion limit
+                }
+                result = await self.graph.ainvoke(initial_state, config=config)
+                
+                # Extract the final response
+                final_message = result["messages"][-1]
+                
+                # Update memory with final response
+                try:
+                    if isinstance(final_message.content, list):
+                        content = " ".join([str(item) for item in final_message.content])
+                    elif isinstance(final_message.content, str):
+                        content = final_message.content
+                    else:
+                        content = str(final_message.content)
+                    await self._update_memory(result, content)
+                except Exception as e:
+                    logger.warning(f"Failed to update memory: {e}")
+                
+                # Handle errors
+                if result.get("errors"):
+                    logger.warning(f"Errors during execution: {result['errors']}")
+                    error_msg = "\n\nNote: " + "\n".join(result['errors'])
+                    return final_message.content + error_msg
+                    
+                return final_message.content
+                
+            except Exception as e:
+                logger.error(f"Error in analysis: {e}")
+                return f"I encountered an error while processing your request: {str(e)}"
 
 # Factory function
 def create_agent():

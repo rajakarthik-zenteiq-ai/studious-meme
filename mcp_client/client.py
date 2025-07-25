@@ -1,33 +1,30 @@
 """
-Enhanced MCP Client with LangGraph Agent Integration
+Enhanced MCP Client for Server Communication
 """
 import os
 import sys
 import json
-import base64
 import asyncio
-import uuid
-from typing import Dict, Any, List, Optional, Tuple
-from datetime import datetime
 import logging
+from datetime import datetime
+from typing import Dict, Any, List, Optional, Tuple
 from contextlib import AsyncExitStack
 
+# Project imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+# Third-party imports
 import httpx
-import nest_asyncio
+import base64
+import uuid
+
 from pydantic import BaseModel
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.sse import sse_client
 
-# LangChain/LangGraph imports
+# LangChain imports for MCPClient class only
 from langchain_core.messages import BaseMessage, HumanMessage, AIMessage, SystemMessage
-from langchain_core.tools import BaseTool
-from langgraph.graph import StateGraph, END
-from langgraph.prebuilt import ToolNode
-from langgraph.graph.message import add_messages
-
-# Apply nest_asyncio to allow nested event loops
-nest_asyncio.apply()
 
 # Logging setup
 logging.basicConfig(level=logging.INFO)
@@ -46,36 +43,38 @@ class MCPLogAnalyticsClient:
     """
     
     def __init__(self):
-        # Server configurations
+        # Server configurations with actual available tools
         self.servers = {
             "mongodb": MCPServer(
                 name="MongoDB Server",
-                url=os.getenv("MONGODB_MCP_URL", "http://localhost:8100/mcp"),
+                url=os.getenv("MONGODB_MCP_URL", "http://localhost:8100/mcp/"),
                 description="Log storage and retrieval",
-                tools=["store_logs", "get_logs_by_date", "append_chat", "upload_dataset", "store_file"]
+                tools=["store_logs", "get_logs_by_date", "query_logs", "search_logs", 
+                      "aggregate_logs", "append_chat", "get_chat_history", "upload_file", 
+                      "download_file", "delete_logs", "get_system_stats", "health_check"]
             ),
             "milvus": MCPServer(
                 name="Milvus Server",
-                url=os.getenv("MILVUS_MCP_URL", "http://localhost:8110/mcp"),
+                url=os.getenv("MILVUS_MCP_URL", "http://localhost:8110/mcp/"),
                 description="Vector similarity search",
                 tools=["create_collection", "insert_vectors", "search_similar", "get_collection_stats"]
             ),
             "websearch": MCPServer(
                 name="WebSearch Server",
-                url=os.getenv("WEBSEARCH_MCP_URL", "http://localhost:8140/mcp"),
+                url=os.getenv("WEBSEARCH_MCP_URL", "http://localhost:8140/mcp/"),
                 description="Web search using OpenAI",
                 tools=["web_search", "health_check"]
             ),
             "scirex": MCPServer(
                 name="SciREX Server",
-                url=os.getenv("SCIREX_MCP_URL", "http://localhost:8150/mcp"),
+                url=os.getenv("SCIREX_MCP_URL", "http://localhost:8150/mcp/"),
                 description="Scientific computing and ML",
                 tools=["train_neural_network", "perform_clustering", "predict", "list_models"]
             )
         }
         
         # HTTP client
-        self.client = httpx.AsyncClient(timeout=30.0)
+        self.client = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
         
         # Connection status
         self.connected_servers = {}
@@ -88,7 +87,7 @@ class MCPLogAnalyticsClient:
         for server_id, server in self.servers.items():
             try:
                 # For FastMCP servers, try to connect to the base URL
-                base_url = server.url.replace('/mcp', '')  # Get base URL
+                base_url = server.url.replace('/mcp/', '')  # Get base URL
                 response = await self.client.get(base_url, timeout=5.0)
                 
                 # Any response (even 404) means server is running
@@ -107,79 +106,185 @@ class MCPLogAnalyticsClient:
         logger.info(f"Connected to {connected_count}/{len(self.servers)} MCP servers")
     
     async def _call_tool(self, server_id: str, tool_name: str, **kwargs) -> Dict[str, Any]:
-        """Call a tool on an MCP server via streamable HTTP"""
+        """Call a tool on an MCP server via FastMCP HTTP transport"""
         if not self.connected_servers.get(server_id, False):
             raise Exception(f"Server {server_id} is not connected")
         
         server = self.servers[server_id]
         
-        # Create JSON-RPC request for MCP
-        request = {
-            "jsonrpc": "2.0",
-            "method": "tools/call",
-            "params": {
-                "name": tool_name,
-                "arguments": kwargs
-            },
-            "id": f"{server_id}_{tool_name}_{datetime.utcnow().timestamp()}"
-        }
-        
         try:
-            # For FastMCP, we need to establish a session and handle streamable responses
             import uuid
             session_id = str(uuid.uuid4())
             
-            # Send request to MCP server using POST with proper headers for FastMCP
+            # Step 1: Initialize session with the server using the /mcp/ endpoint
+            init_request = {
+                "jsonrpc": "2.0",
+                "method": "initialize",
+                "params": {
+                    "protocolVersion": "2024-11-05",
+                    "capabilities": {
+                        "roots": {
+                            "listChanged": True
+                        },
+                        "sampling": {}
+                    },
+                    "clientInfo": {
+                        "name": "MCP-LogAnalytics-Client",
+                        "version": "1.0.0"
+                    }
+                },
+                "id": f"init_{session_id}"
+            }
+            
             headers = {
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
+                "Session-ID": session_id,
                 "X-Session-ID": session_id,
-                "Session-ID": session_id,  # Add both header formats
                 "User-Agent": "MCP-Client/1.0"
             }
             
-            logger.info(f"Calling {tool_name} on {server_id} with session {session_id}")
+            logger.info(f"Initializing session {session_id} for {server_id}")
+            
+            # Initialize session on the /mcp/ endpoint
+            init_response = await self.client.post(
+                server.url,  # This should be http://localhost:8140/mcp
+                json=init_request,
+                headers=headers,
+                timeout=30.0
+            )
+            
+            logger.info(f"Init response status: {init_response.status_code}")
+            if init_response.status_code != 200:
+                logger.error(f"Session initialization failed: {init_response.text}")
+                return {"success": False, "error": f"Session init failed: {init_response.status_code}"}
+            
+            # Extract the session ID from the response if provided
+            response_headers = dict(init_response.headers)
+            server_session_id = response_headers.get("mcp-session-id", session_id)
+            
+            logger.info(f"Server provided session ID: {server_session_id}")
+            
+            # Update headers with the server-provided session ID
+            headers["Session-ID"] = server_session_id
+            headers["X-Session-ID"] = server_session_id
+            headers["MCP-Session-ID"] = server_session_id  # Try FastMCP specific header
+            
+            # Step 1.5: Send initialized notification (required by MCP protocol)
+            initialized_request = {
+                "jsonrpc": "2.0",
+                "method": "notifications/initialized",
+                "params": {}
+            }
+            
+            logger.info(f"Sending initialized notification for session {server_session_id}")
+            initialized_response = await self.client.post(
+                server.url,
+                json=initialized_request,
+                headers=headers,
+                timeout=30.0
+            )
+            
+            logger.info(f"Initialized response status: {initialized_response.status_code}")
+            
+            logger.info(f"Updated headers: {headers}")
+            
+            # Step 2: Call the tool with the established session
+            tool_request = {
+                "jsonrpc": "2.0",
+                "method": "tools/call",
+                "params": {
+                    "name": tool_name,
+                    "arguments": kwargs
+                },
+                "id": f"{server_id}_{tool_name}_{datetime.utcnow().timestamp()}"
+            }
+            
+            logger.info(f"Calling {tool_name} on {server_id} with session {server_session_id}")
+            logger.info(f"Tool request: {tool_request}")
             
             response = await self.client.post(
-                f"{server.url}/tools/call",
-                json=request,
+                server.url,  # Use the same /mcp/ endpoint
+                json=tool_request,
                 headers=headers,
                 timeout=60.0
             )
             
-            logger.info(f"Response status: {response.status_code}")
-            if response.status_code != 200:
-                logger.error(f"Response headers: {dict(response.headers)}")
-                logger.error(f"Response text: {response.text}")
+            logger.info(f"Tool call response status: {response.status_code}")
+            logger.info(f"Response headers: {dict(response.headers)}")
+            logger.info(f"Response content: {response.text[:500]}")  # First 500 chars
             
             if response.status_code == 200:
-                # Handle both JSON and streaming responses
-                content_type = response.headers.get("content-type", "")
-                
-                if "text/event-stream" in content_type:
-                    # Handle Server-Sent Events
-                    lines = response.text.strip().split('\n')
-                    for line in lines:
-                        if line.startswith('data: '):
-                            try:
-                                data = json.loads(line[6:])  # Remove 'data: ' prefix
-                                if data.get("type") == "result":
-                                    return data.get("content", {"success": False, "error": "No content"})
-                            except json.JSONDecodeError:
-                                continue
-                    return {"success": False, "error": "No valid data in stream"}
-                else:
-                    # Handle regular JSON response
-                    result = response.json()
-                    return result.get("result", {"success": False, "error": "No result received"})
+                try:
+                    # Check if response is SSE format
+                    content_type = response.headers.get("content-type", "")
+                    response_text = response.text
+                    
+                    if "text/event-stream" in content_type:
+                        # Parse SSE format
+                        logger.info("Parsing SSE response")
+                        lines = response_text.strip().split('\n')
+                        json_data = None
+                        
+                        for line in lines:
+                            if line.startswith('data: '):
+                                json_str = line[6:]  # Remove 'data: ' prefix
+                                try:
+                                    json_data = json.loads(json_str)
+                                    break
+                                except json.JSONDecodeError:
+                                    continue
+                        
+                        if json_data:
+                            result = json_data
+                        else:
+                            return {"success": False, "error": "Could not parse SSE data"}
+                    else:
+                        # Parse regular JSON
+                        result = response.json()
+                    
+                    logger.info(f"Parsed result: {result}")
+                    
+                    if "result" in result:
+                        tool_result = result["result"]
+                        if isinstance(tool_result, dict) and "content" in tool_result:
+                            # Extract content from MCP tool result
+                            content = tool_result["content"]
+                            if isinstance(content, list) and content:
+                                # Get text from the first content item
+                                first_content = content[0]
+                                if isinstance(first_content, dict) and "text" in first_content:
+                                    text_content = first_content["text"]
+                                    # Try to parse as JSON if it looks like JSON
+                                    if text_content.startswith('[') or text_content.startswith('{'):
+                                        try:
+                                            return {"success": True, "results": json.loads(text_content)}
+                                        except:
+                                            return {"success": True, "results": text_content}
+                                    else:
+                                        return {"success": True, "results": text_content}
+                                else:
+                                    return {"success": True, "results": first_content}
+                            else:
+                                return {"success": True, "results": content}
+                        else:
+                            return {"success": True, "results": tool_result}
+                    elif "error" in result:
+                        return {"success": False, "error": result["error"]["message"]}
+                    else:
+                        return {"success": False, "error": "No result in response"}
+                except Exception as e:
+                    logger.error(f"Error parsing response: {e}")
+                    return {"success": True, "results": response.text}
             else:
-                logger.error(f"HTTP {response.status_code}: {response.text}")
+                logger.error(f"Response headers: {dict(response.headers)}")
+                logger.error(f"Response text: {response.text}")
                 return {"success": False, "error": f"HTTP {response.status_code}: {response.text}"}
                 
         except Exception as e:
             logger.error(f"Error calling {tool_name} on {server_id}: {e}")
             return {"success": False, "error": f"Tool call error: {str(e)}"}
-    
+
     # MongoDB operations
     async def store_logs(self, logs: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Store log entries in MongoDB"""
@@ -189,6 +294,14 @@ class MCPLogAnalyticsClient:
         """Get logs by date from MongoDB"""
         result = await self._call_tool("mongodb", "get_logs_by_date", date=date, level=level)
         return result.get("logs", [])
+    
+    async def get_system_stats(self) -> Dict[str, Any]:
+        """Get MongoDB system statistics"""
+        return await self._call_tool("mongodb", "get_system_stats")
+    
+    async def health_check(self, server_id: str = "mongodb") -> Dict[str, Any]:
+        """Get health check for specified server"""
+        return await self._call_tool(server_id, "health_check")
     
     async def append_chat(self, user_id: str, conversation_id: str, message: str, role: str = "user") -> Dict[str, Any]:
         """Append chat message to conversation"""
@@ -201,11 +314,11 @@ class MCPLogAnalyticsClient:
             role=role
         )
     
-    async def upload_dataset(self, user_id: str, filename: str, content_base64: str, metadata: Optional[Dict] = None) -> Dict[str, Any]:
-        """Upload dataset to MongoDB"""
+    async def upload_file(self, user_id: str, filename: str, content_base64: str, metadata: Optional[Dict] = None) -> Dict[str, Any]:
+        """Upload file to MongoDB GridFS"""
         return await self._call_tool(
             "mongodb",
-            "upload_dataset",
+            "upload_file",
             user_id=user_id,
             filename=filename,
             content_base64=content_base64,
@@ -217,7 +330,7 @@ class MCPLogAnalyticsClient:
         content_base64 = base64.b64encode(content).decode()
         return await self._call_tool(
             "mongodb",
-            "store_file",
+            "upload_file",
             user_id=user_id,
             filename=filename,
             content_base64=content_base64,
@@ -225,21 +338,15 @@ class MCPLogAnalyticsClient:
         )
     
     # Vector search operations
-    async def find_similar_logs(self, query: str, top_k: int = 10) -> List[Dict[str, Any]]:
-        """Find similar logs using vector search"""
-        # First, get embedding from websearch server
-        embedding_result = await self._call_tool("websearch", "get_embedding", text=query)
-        embedding = embedding_result.get("embedding", [])
-        
-        # Search in Milvus
+    async def search_similar_vectors(self, collection_name: str, query_vectors: List[List[float]], top_k: int = 10) -> List[Dict[str, Any]]:
+        """Search similar vectors in Milvus"""
         result = await self._call_tool(
             "milvus",
             "search_similar",
-            collection_name="logs",
-            query_vectors=[embedding],
+            collection_name=collection_name,
+            query_vectors=query_vectors,
             top_k=top_k
         )
-        
         return result.get("results", [])
     
     async def cluster_logs(self, dataset_id: str, n_clusters: int = 5) -> Dict[str, Any]:
@@ -251,8 +358,6 @@ class MCPLogAnalyticsClient:
             n_clusters=n_clusters,
             method="kmeans"
         )
-    
-    # Remove Neo4j operations: add_to_knowledge_graph, query_knowledge_graph, etc.
     
     # ML operations
     async def train_neural_network(
@@ -297,10 +402,24 @@ class MCPLogAnalyticsClient:
             limit=max_results
         )
         
-        # Handle both successful results and errors
+        # Handle various response formats
         if isinstance(result, dict):
             if result.get("success", False):
-                return result.get("results", [])
+                results = result.get("results", [])
+                # Handle both list and string results
+                if isinstance(results, str):
+                    try:
+                        # Try to parse as JSON if it's a string
+                        import json
+                        results = json.loads(results)
+                    except:
+                        # If not JSON, wrap in a list
+                        results = [{"title": "Web Search Result", "content": results}]
+                elif isinstance(results, list):
+                    return results
+                else:
+                    results = [{"title": "Web Search Result", "content": str(results)}]
+                return results
             else:
                 logger.error(f"Web search failed: {result.get('error', 'Unknown error')}")
                 return []
@@ -353,359 +472,10 @@ class MCPLogAnalyticsClient:
         """Close HTTP client"""
         await self.client.aclose()
 
-# Agent State for LangGraph
-from typing import TypedDict, Annotated, Sequence
-import operator
-
-class AgentState(TypedDict):
-    """State for the MCP LangGraph agent"""
-    messages: Annotated[Sequence[BaseMessage], add_messages]
-    tools_available: List[Dict[str, Any]]
-    current_tool_results: Dict[str, Any]
-
-class MCPTool(BaseTool):
-    """LangChain tool wrapper for MCP tools"""
-    
-    def __init__(self, name: str, description: str, mcp_client, server: str, tool_name: str, parameters: Dict[str, Any]):
-        super().__init__(name=name, description=description)
-        self.mcp_client = mcp_client
-        self.server = server
-        self.tool_name = tool_name
-        self.parameters = parameters
-    
-    def _run(self, **kwargs) -> str:
-        """Synchronous run - not used"""
-        raise NotImplementedError("Use async version")
-    
-    async def _arun(self, **kwargs) -> str:
-        """Execute the MCP tool"""
-        try:
-            result = await self.mcp_client._call_tool(self.server, self.tool_name, **kwargs)
-            return json.dumps(result, indent=2)
-        except Exception as e:
-            return f"Error executing tool {self.tool_name}: {str(e)}"
-
-class MCPLLMAgent:
-    """LangGraph-based agent wrapper for LLM routing and MCP tool integration"""
-    
-    def __init__(self, mcp_client, default_provider: str = "openai", default_model: str = "gpt-4o-mini"):
-        self.mcp_client = mcp_client
-        self.default_provider = default_provider
-        self.default_model = default_model
-        
-        # Import LLM factory here to avoid circular imports
-        import sys
-        from pathlib import Path
-        sys.path.insert(0, str(Path(__file__).parent.parent))
-        
-        from agent.llm_providers import LLMProviderFactory
-        self.llm_factory = LLMProviderFactory()
-        
-        # Initialize LangGraph
-        self.graph = None
-        self._build_graph()
-    
-    def _build_graph(self):
-        """Build the LangGraph workflow"""
-        workflow = StateGraph(AgentState)
-        
-        # Add nodes
-        workflow.add_node("agent", self._agent_node)
-        workflow.add_node("tools", self._tools_node)
-        
-        # Add edges
-        workflow.set_entry_point("agent")
-        workflow.add_conditional_edges(
-            "agent",
-            self._should_continue,
-            {
-                "continue": "tools",
-                "end": END
-            }
-        )
-        workflow.add_edge("tools", "agent")
-        
-        # Set recursion limit to 50 to avoid hitting the default limit
-        self.graph = workflow.compile()
-    
-    async def _agent_node(self, state: AgentState) -> AgentState:
-        """Agent decision node with dynamic LLM routing"""
-        messages = state["messages"]
-        tools = state.get("tools_available", [])
-        
-        # Get LLM instance with current provider/model settings
-        llm = self.llm_factory.get_llm(self.default_provider, model=self.default_model)
-        
-        # Add system message for tool awareness if tools are available
-        if tools and len(messages) == 1:  # Only add system message for first interaction
-            system_message = SystemMessage(content=f"""You are an intelligent assistant with access to {len(tools)} tools.
-            
-Available tools include:
-{', '.join([tool.get('name', 'unknown') for tool in tools[:10]])}
-
-Use these tools when appropriate to help answer the user's question. Always prefer using tools over making assumptions.""")
-            messages = [system_message] + list(messages)
-        
-        # Bind tools to LLM if available
-        if tools:
-            tool_schemas = [self._format_tool_for_openai(tool) for tool in tools]
-            llm = llm.bind_tools(tool_schemas)
-        
-        # Generate response
-        response = await llm.ainvoke(messages)
-
-        return {
-            "messages": [response],
-            "tools_available": state.get("tools_available", []),
-            "current_tool_results": state.get("current_tool_results", {}),
-        }
-
-    async def _tools_node(self, state: AgentState) -> AgentState:
-        """Execute tools and return results"""
-        last_message = state["messages"][-1]
-        
-        # Support both dict and object attribute access for tool_calls
-        tool_calls = None
-        if isinstance(last_message, dict):
-            tool_calls = last_message.get("tool_calls", [])
-        else:
-            tool_calls = getattr(last_message, "tool_calls", [])
-
-        if tool_calls:
-            tool_results = []
-            for tool_call in tool_calls:
-                # Ensure tool_name is a string
-                tool_name = tool_call.get("name") if isinstance(tool_call, dict) else getattr(tool_call, "name", None)
-                if not isinstance(tool_name, str) or not tool_name:
-                    continue  # skip invalid tool calls
-                tool_args = tool_call.get("args", {}) if isinstance(tool_call, dict) else getattr(tool_call, "args", {})
-                try:
-                    result = await self._execute_mcp_tool(tool_name, tool_args)
-                    tool_results.append({
-                        "tool_call_id": tool_call.get("id") if isinstance(tool_call, dict) else getattr(tool_call, "id", None),
-                        "content": result
-                    })
-                except Exception as e:
-                    tool_results.append({
-                        "tool_call_id": tool_call.get("id") if isinstance(tool_call, dict) else getattr(tool_call, "id", None),
-                        "content": f"Error: {str(e)}"
-                    })
-            # Create tool messages
-            tool_messages = []
-            for result in tool_results:
-                tool_messages.append({
-                    "role": "tool",
-                    "tool_call_id": result["tool_call_id"],
-                    "content": result["content"]
-                })
-            return {
-                "messages": tool_messages,
-                "current_tool_results": {"results": tool_results},
-                "tools_available": state.get("tools_available", []),
-            }
-        return {
-            "messages": [],
-            "current_tool_results": {},
-            "tools_available": state.get("tools_available", []),
-        }
-
-    def _should_continue(self, state: AgentState) -> str:
-        """Decide whether to continue with tools or end"""
-        last_message = state["messages"][-1]
-        # Check if last_message is a dict and has 'tool_calls' key
-        tool_calls = None
-        if isinstance(last_message, dict):
-            tool_calls = last_message.get("tool_calls")
-        else:
-            # Try attribute access for compatibility with message objects
-            tool_calls = getattr(last_message, "tool_calls", None)
-        if tool_calls:
-            return "continue"
-        return "end"
-
-    async def _execute_mcp_tool(self, tool_name: str, args: Dict[str, Any]) -> str:
-        """Execute an MCP tool by name"""
-        tool_mapping = {
-            "store_logs": ("mongodb", "store_logs"),
-            "get_logs_by_date": ("mongodb", "get_logs_by_date"),
-            "web_search": ("websearch", "web_search"),
-            "search_similar": ("milvus", "search_similar"),
-            "train_neural_network": ("scirex", "train_neural_network"),
-            "perform_clustering": ("scirex", "perform_clustering"),
-            "summarize_text": ("websearch", "summarize_text"),
-        }
-        if tool_name in tool_mapping:
-            server, method = tool_mapping[tool_name]
-            result = await self.mcp_client._call_tool(server, method, **args)
-            return json.dumps(result, indent=2)
-        else:
-            return f"Unknown tool: {tool_name}"
-
-    def _format_tool_for_openai(self, tool: Dict[str, Any]) -> Dict[str, Any]:
-        """Format MCP tool for OpenAI function calling"""
-        return {
-            "type": "function",
-            "function": {
-                "name": tool["name"],
-                "description": tool["description"],
-                "parameters": tool.get("parameters", {"type": "object", "properties": {}})
-            }
-        }
-
-    async def process_query(self, query: str, provider: Optional[str] = None, model: Optional[str] = None, 
-                          tools: Optional[List[Dict[str, Any]]] = None, tool_choice: str = "auto") -> str:
-        """Process a query using the LangGraph agent with MCP tools"""
-        # Use provided or default provider/model
-        if provider:
-            self.default_provider = provider
-        if model:
-            self.default_model = model
-        # Get available MCP tools if not provided
-        if tools is None:
-            tools = []
-        # Initialize state
-        initial_state: AgentState = {
-            "messages": [HumanMessage(content=query)],
-            "tools_available": tools,
-            "current_tool_results": {}
-        }
-        # Ensure the graph is initialized
-        if self.graph is None:
-            raise RuntimeError("LangGraph workflow is not initialized.")
-        # Run the graph with increased recursion limit
-        final_state = await self.graph.ainvoke(initial_state, config={"recursion_limit": 50})
-        # Extract the final response
-        messages = final_state["messages"]
-        if messages:
-            last_message = messages[-1]
-            if hasattr(last_message, 'content'):
-                if isinstance(last_message.content, list):
-                    # Join list of strings/dicts as a string
-                    return "\n".join(str(x) for x in last_message.content)
-                return str(last_message.content)
-            elif isinstance(last_message, dict) and 'content' in last_message:
-                content = last_message['content']
-                if isinstance(content, list):
-                    return "\n".join(str(x) for x in content)
-                return str(content)
-            elif isinstance(last_message, list):
-                return "\n".join(str(x) for x in last_message)
-            else:
-                return str(last_message)
-        # Final fallback: always return a string
-        return "No response generated"
-    
-    def switch_provider(self, provider: str, model: Optional[str] = None):
-        """
-        Switch LLM provider and model dynamically
-        
-        Args:
-            provider: New provider (openai, gemini, vllm)
-            model: New model (optional, uses default if not provided)
-        """
-        self.default_provider = provider
-        if model:
-            self.default_model = model
-        
-        logger.info(f"Switched to provider: {provider}, model: {self.default_model}")
-    
-    def get_available_providers(self) -> dict:
-        """Get available LLM providers and their status"""
-        return self.llm_factory.get_available_providers()
-
-# Convenience functions for standalone usage
-async def create_client() -> MCPLogAnalyticsClient:
-    """Create and initialize MCP client"""
-    client = MCPLogAnalyticsClient()
-    await client.initialize()
-    return client
-
-async def test_client():
-    """Test MCP client functionality"""
-    client = await create_client()
-    
-    try:
-        # Test server status
-        status = await client.get_server_status()
-        print("Server Status:")
-        for server_id, info in status.items():
-            print(f"  {info['name']}: {'✅' if info['connected'] else '❌'}")
-        
-        # Test storing logs
-        if status["mongodb"]["connected"]:
-            print("\nTesting log storage...")
-            result = await client.store_logs([
-                {
-                    "timestamp": datetime.utcnow().isoformat(),
-                    "level": "INFO",
-                    "message": "Test log entry",
-                    "source": "mcp_client_test"
-                }
-            ])
-            print(f"  Stored logs: {result}")
-        
-        # Test web search
-        if status["websearch"]["connected"]:
-            print("\nTesting web search...")
-            results = await client.web_search("artificial intelligence news", max_results=3)
-            print(f"  Found {len(results)} results")
-        
-    finally:
-        await client.close()
-
-async def test_mcp_client_with_agent():
-    """Test the new MCPClient with LangGraph agent"""
-    print("Testing MCPClient with LangGraph Agent...")
-    
-    # Create client with OpenAI provider
-    client = await create_mcp_client(provider="openai", model="gpt-4o-mini")
-    
-    try:
-        # Test queries that should use different tools
-        test_queries = [
-            "Search for the latest news about artificial intelligence",
-            "Store a test log entry with current timestamp", 
-            "What information do you have about machine learning?",
-            "Can you summarize the text 'Artificial intelligence is transforming industries across the globe'?",
-        ]
-        
-        for query in test_queries:
-            print(f"\nQuery: {query}")
-            try:
-                response = await client.process_query(query)
-                print(f"Response: {response}")
-            except Exception as e:
-                print(f"Error: {e}")
-        
-        # Test connecting to a local MCP server
-        try:
-            print("\nTesting connection to local MCP server...")
-            # This would connect to a server.py file if it exists
-            # connection_id = await client.connect_to_server("server.py", "stdio")
-            # print(f"Connected with ID: {connection_id}")
-        except Exception as e:
-            print(f"Could not connect to local server: {e}")
-        
-        # Test getting available tools
-        print("\nAvailable tools:")
-        tools = await client.get_mcp_tools()
-        for tool in tools[:5]:  # Show first 5 tools
-            func = tool.get("function", {})
-            print(f"  - {func.get('name', 'unknown')}: {func.get('description', 'no description')}")
-        
-    finally:
-        await client.cleanup()
-
-if __name__ == "__main__":
-    # Run both test functions
-    asyncio.run(test_client())
-    print("\n" + "="*50 + "\n")
-    asyncio.run(test_mcp_client_with_agent())
-
 class MCPClient:
     """
-    Enhanced MCP Client with LangGraph-based agent integration
-    Similar to the reference MCPOpenAIClient but with multi-provider support
+    Enhanced MCP Client with agent integration support
+    This class integrates with the agent module for LLM-based tool calling
     """
     
     def __init__(self, provider: str = "openai", model: str = "gpt-4o-mini"):
@@ -722,24 +492,24 @@ class MCPClient:
         
         # Initialize MCP connections
         self.mcp_client = MCPLogAnalyticsClient()
-        self.mcp_llm_agent = None
+        self.agent = None
         
         # Store sessions for different connection types
         self.sessions = {}
         self.stdio_connections = {}
     
     async def initialize(self):
-        """Initialize all MCP server connections"""
+        """Initialize all MCP server connections and agent"""
         await self.mcp_client.initialize()
         
-        # Initialize the LangGraph agent
-        self.mcp_llm_agent = MCPLLMAgent(
-            mcp_client=self.mcp_client,
-            default_provider=self.provider,
-            default_model=self.model
-        )
-        
-        logger.info(f"MCPClient initialized with provider: {self.provider}, model: {self.model}")
+        # Initialize the agent from the agent module instead of duplicating it here
+        try:
+            from agent.agent import LogAnalyticsAgent
+            self.agent = LogAnalyticsAgent(llm_provider=self.provider)
+            await self.agent.initialize()
+            logger.info(f"MCPClient initialized with provider: {self.provider}, model: {self.model}")
+        except ImportError as e:
+            logger.warning(f"Could not import agent: {e}. Agent functionality will not be available.")
     
     async def connect_to_server(self, server_script_path: str, connection_type: str = "stdio") -> str:
         """
@@ -828,7 +598,7 @@ class MCPClient:
     
     async def process_query(self, query: str) -> str:
         """
-        Process a query using the LangGraph agent with MCP tools
+        Process a query using the agent with MCP tools
         
         Args:
             query: The user query
@@ -836,18 +606,9 @@ class MCPClient:
         Returns:
             The response from the agent
         """
-        # Get available tools
-        tools = await self.get_mcp_tools()
-        
-        # Use the MCP LLM agent to process the query with automatic tool calling
-        if self.mcp_llm_agent:
-            response = await self.mcp_llm_agent.process_query(
-                query=query,
-                provider=self.provider,
-                model=self.model,
-                tools=tools,
-                tool_choice="auto"
-            )
+        if self.agent:
+            # Use the agent to process the query
+            response = await self.agent.analyze_logs(query)
             if isinstance(response, list):
                 return "\n".join(str(x) for x in response)
             return str(response)
@@ -897,9 +658,52 @@ class MCPClient:
         except Exception as e:
             logger.error(f"Error during cleanup: {e}")
 
-# Convenience functions
-async def create_mcp_client(provider: str = "openai", model: str = "gpt-4o-mini") -> MCPClient:
+# Convenience functions for standalone usage
+async def create_client() -> MCPLogAnalyticsClient:
     """Create and initialize MCP client"""
+    client = MCPLogAnalyticsClient()
+    await client.initialize()
+    return client
+
+async def create_mcp_client(provider: str = "openai", model: str = "gpt-4o-mini") -> MCPClient:
+    """Create and initialize MCP client with agent support"""
     client = MCPClient(provider=provider, model=model)
     await client.initialize()
     return client
+
+async def test_client():
+    """Test MCP client functionality"""
+    client = await create_client()
+    
+    try:
+        # Test server status
+        status = await client.get_server_status()
+        print("Server Status:")
+        for server_id, info in status.items():
+            print(f"  {info['name']}: {'✅' if info['connected'] else '❌'}")
+        
+        # Test storing logs
+        if status["mongodb"]["connected"]:
+            print("\nTesting log storage...")
+            result = await client.store_logs([
+                {
+                    "timestamp": datetime.utcnow().isoformat(),
+                    "level": "INFO",
+                    "message": "Test log entry",
+                    "source": "mcp_client_test"
+                }
+            ])
+            print(f"  Stored logs: {result}")
+        
+        # Test web search
+        if status["websearch"]["connected"]:
+            print("\nTesting web search...")
+            results = await client.web_search("artificial intelligence news", max_results=3)
+            print(f"  Found {len(results)} results")
+        
+    finally:
+        await client.close()
+
+if __name__ == "__main__":
+    # Run the test function
+    asyncio.run(test_client())
