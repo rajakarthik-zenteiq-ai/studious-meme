@@ -61,16 +61,16 @@ else:
 # IMPORTANT: Updated from SSE to HTTP transport
 if IS_DOCKER:
     # In Docker, use service names
-    MONGODB_MCP_URL = os.getenv("MONGODB_MCP_URL", "http://mongo_server:8100")
-    MILVUS_MCP_URL = os.getenv("MILVUS_MCP_URL", "http://milvus_server:8110")
-    WEBSEARCH_MCP_URL = os.getenv("WEBSEARCH_MCP_URL", "http://websearch_server:8105")
-    SCIREX_MCP_URL = os.getenv("SCIREX_MCP_URL", "http://scirex_server:8150")
+    MONGODB_MCP_URL = os.getenv("MONGODB_MCP_URL", "http://mongo_server:8100/mcp/")
+    MILVUS_MCP_URL = os.getenv("MILVUS_MCP_URL", "http://milvus_server:8110/mcp/")
+    WEBSEARCH_MCP_URL = os.getenv("WEBSEARCH_MCP_URL", "http://websearch_server:8140/mcp/")
+    SCIREX_MCP_URL = os.getenv("SCIREX_MCP_URL", "http://scirex_server:8150/mcp/")
 else:
     # In local development, use localhost
-    MONGODB_MCP_URL = os.getenv("MONGODB_MCP_URL", "http://localhost:8100")
-    MILVUS_MCP_URL = os.getenv("MILVUS_MCP_URL", "http://localhost:8110")
-    WEBSEARCH_MCP_URL = os.getenv("WEBSEARCH_MCP_URL", "http://localhost:8105")
-    SCIREX_MCP_URL = os.getenv("SCIREX_MCP_URL", "http://localhost:8150")
+    MONGODB_MCP_URL = os.getenv("MONGODB_MCP_URL", "http://localhost:8100/mcp/")
+    MILVUS_MCP_URL = os.getenv("MILVUS_MCP_URL", "http://localhost:8110/mcp/")
+    WEBSEARCH_MCP_URL = os.getenv("WEBSEARCH_MCP_URL", "http://localhost:8140/mcp/")
+    SCIREX_MCP_URL = os.getenv("SCIREX_MCP_URL", "http://localhost:8150/mcp/")
 
 # ── General Settings ───────────────────────────────────────────────
 DEBUG = os.getenv("DEBUG", "true").lower() == "true"

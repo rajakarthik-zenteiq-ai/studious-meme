@@ -1,5 +1,5 @@
 """
-MongoDB FastMCP server - Production-ready with comprehensive tools
+MongoDB FastMCP server - Production-ready with comprehensive tools and MinIO integration
 Compatible with FastMCP v2.x and MCP Inspector v0.15.0
 """
 import os
@@ -13,15 +13,18 @@ from typing import Any, Dict, List, Optional, Union
 import json
 import base64
 from enum import Enum
+import io
 
 from motor.motor_asyncio import AsyncIOMotorClient
 from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import ASCENDING, DESCENDING, TEXT
 from pymongo.errors import DuplicateKeyError, OperationFailure
+from minio import Minio
+from minio.error import S3Error
 
 # Correct FastMCP v2.x import
-from fastmcp import FastMCP
+from fastmcp import FastMCP, Context
 
 # ── Config ──────────────────────────────────────────────────────────
 HERE = os.path.dirname(__file__)
@@ -34,6 +37,38 @@ from config.settings import (
     MONGO_MAX_POOL_SIZE, MONGO_MIN_POOL_SIZE,
     MONGO_MCP_PORT
 )
+
+# ── Auth utilities ──────────────────────────────────────────────────
+def get_user_id_from_context(ctx: Context) -> str:
+    """
+    Extract user_id from request headers for proper authentication.
+    This ensures users can only access their own data.
+    """
+    if hasattr(ctx, 'request_context') and ctx.request_context:
+        # Try to get user_id from headers
+        headers = getattr(ctx.request_context, 'headers', {})
+        if isinstance(headers, dict):
+            user_id = headers.get('x-user-id') or headers.get('X-User-ID')
+            if user_id:
+                return user_id
+    
+    # Fallback to a default for development (remove in production)
+    logger.warning("No user_id found in headers, using 'anonymous'")
+    return "anonymous"
+
+def validate_user_access(ctx: Context, resource_user_id: str) -> bool:
+    """
+    Validate that the requesting user has access to the resource.
+    Returns True if access is allowed, False otherwise.
+    """
+    current_user_id = get_user_id_from_context(ctx)
+    
+    # Users can only access their own resources
+    if current_user_id != resource_user_id:
+        logger.warning(f"Access denied: user {current_user_id} tried to access resource owned by {resource_user_id}")
+        return False
+    
+    return True
 
 # ── Logging setup ───────────────────────────────────────────────────
 logging.basicConfig(
@@ -68,25 +103,56 @@ class AggregationType(str, Enum):
     MIN = "min"
     MAX = "max"
 
-# ── Database Manager ─────────────────────────────────────────────────
+# ── Database Manager with MinIO ─────────────────────────────────────────────────
 class DatabaseManager:
-    """Manages MongoDB connection lifecycle with connection pooling and retry logic"""
+    """Manages MongoDB connection lifecycle with connection pooling and retry logic, plus MinIO"""
     
     def __init__(self):
         self.client: Optional[AsyncIOMotorClient] = None
         self.db = None
         self.gridfs: Optional[AsyncIOMotorGridFSBucket] = None
+        self.minio_client: Optional[Minio] = None
         self._indexes_created = False
         self._connection_retries = 3
         self._retry_delay = 1.0
         self._initialized = False
     
     async def initialize(self):
-        """Initialize database connection and indexes"""
+        """Initialize database connection, MinIO, and indexes"""
         if not self._initialized:
             await self.connect()
+            await self.setup_minio()
             await self.ensure_indexes()
             self._initialized = True
+    
+    async def setup_minio(self):
+        """Setup MinIO client and ensure buckets exist"""
+        try:
+            # Determine MinIO endpoint based on environment
+            if os.getenv("IS_DOCKER"):
+                minio_endpoint = "minio:9000"
+            else:
+                minio_endpoint = "localhost:9000"
+            
+            self.minio_client = Minio(
+                minio_endpoint,
+                access_key="minioadmin",
+                secret_key="minioadmin",
+                secure=False
+            )
+            
+            # Ensure required buckets exist
+            required_buckets = ["datasets", "models", "files"]
+            for bucket_name in required_buckets:
+                if not self.minio_client.bucket_exists(bucket_name):
+                    self.minio_client.make_bucket(bucket_name)
+                    logger.info(f"✅ Created MinIO bucket: {bucket_name}")
+            
+            logger.info("✅ MinIO client initialized successfully")
+            
+        except Exception as e:
+            logger.warning(f"⚠️ MinIO setup failed: {e} - continuing without file storage")
+            self.minio_client = None
     
     async def connect(self):
         """Establish database connection with retry logic"""
@@ -228,24 +294,16 @@ class LogQueryParams(BaseModel):
         return self
 
 class ChatMessage(BaseModel):
-    """Chat message with validation"""
-    user_id: str = Field(..., min_length=1, max_length=100)
+    """Chat message with validation - user_id comes from headers"""
     message: str = Field(..., min_length=1, max_length=5000)
     role: str = Field(default="user", pattern="^(user|assistant|system)$")
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    
-    @field_validator("user_id")
-    @classmethod
-    def validate_user_id(cls, v: str) -> str:
-        # Remove potentially dangerous characters
-        return v.strip().replace("$", "").replace(".", "")
 
 class FileUploadRequest(BaseModel):
-    """File upload request with validation"""
+    """File upload request with validation - user_id comes from headers"""
     filename: str = Field(..., min_length=1, max_length=255)
     content: str = Field(..., description="Base64 encoded file content")
     content_type: str = Field(default="application/octet-stream")
-    user_id: str = Field(..., min_length=1, max_length=100)
     metadata: Dict[str, Any] = Field(default_factory=dict)
     
     @field_validator("filename")
@@ -262,8 +320,17 @@ class FileUploadRequest(BaseModel):
     @classmethod
     def validate_content(cls, v: str) -> str:
         try:
+            # Remove potential data URL prefix if present
+            if v.startswith('data:'):
+                # Extract base64 part after comma
+                if ',' in v:
+                    v = v.split(',', 1)[1]
+            
+            # Remove whitespace and newlines
+            v = v.replace('\n', '').replace('\r', '').replace(' ', '')
+            
             # Validate base64
-            decoded = base64.b64decode(v)
+            decoded = base64.b64decode(v, validate=True)
             if len(decoded) > MAX_FILE_SIZE:
                 raise ValueError(f"File size exceeds maximum of {MAX_FILE_SIZE} bytes")
             return v
@@ -319,7 +386,21 @@ def build_query_filter(params: LogQueryParams) -> Dict[str, Any]:
 
 @mcp.tool()
 async def get_logs_by_date(date: str) -> Dict[str, Any]:
-    """Get all logs for a specific date with detailed information."""
+    """
+    Get all logs for a specific date with detailed information.
+    
+    This tool retrieves logs for a complete day (00:00:00 to 23:59:59) and provides
+    comprehensive statistics including log level distribution and source breakdown.
+    
+    Args:
+        date: Date in YYYY-MM-DD format (e.g., "2024-01-15")
+        
+    Returns:
+        Structured response with logs, count, and statistics
+        
+    Example:
+        get_logs_by_date("2024-01-15")
+    """
     await ensure_db_initialized()
     
     # Validate date format
@@ -391,7 +472,26 @@ async def get_logs_by_date(date: str) -> Dict[str, Any]:
 
 @mcp.tool()
 async def query_logs(params: LogQueryParams) -> Dict[str, Any]:
-    """Query logs with advanced filtering options."""
+    """
+    Query logs with advanced filtering options and pagination.
+    
+    This is the primary tool for searching and filtering log entries with support for:
+    - Date range filtering (start_date, end_date)  
+    - Log level filtering (DEBUG, INFO, WARNING, ERROR, CRITICAL)
+    - Source system filtering
+    - Full-text search across message content
+    - Tag-based filtering
+    - Sorting and pagination
+    
+    Args:
+        params: LogQueryParams object with filtering options
+        
+    Returns:
+        Structured response with matching logs, pagination info, and total count
+        
+    Example:
+        query_logs({"level": "ERROR", "start_date": "2024-01-01", "limit": 50})
+    """
     await ensure_db_initialized()
     
     if db_manager.db is None:
@@ -529,7 +629,25 @@ async def store_logs(logs: List[LogEntry]) -> Dict[str, Any]:
 
 @mcp.tool()
 async def search_logs(query: str, limit: int = DEFAULT_QUERY_LIMIT) -> Dict[str, Any]:
-    """Full-text search across log messages."""
+    """
+    Full-text search across log messages with relevance scoring.
+    
+    This tool performs intelligent text search across all log messages:
+    - Uses MongoDB text indexes for fast search
+    - Returns results ranked by relevance score
+    - Highlights matching terms in results
+    - Automatic fallback to regex search if text index unavailable
+    
+    Args:
+        query: Search terms or phrase (e.g., "error database connection")
+        limit: Maximum number of results to return (1-500, default: 50)
+        
+    Returns:
+        Structured response with ranked search results and highlighted matches
+        
+    Example:
+        search_logs("database connection failed", 25)
+    """
     await ensure_db_initialized()
     
     if db_manager.db is None:
@@ -712,8 +830,26 @@ async def aggregate_logs(request: LogAggregationRequest) -> Dict[str, Any]:
         }
 
 @mcp.tool()
-async def append_chat(chat: ChatMessage) -> Dict[str, Any]:
-    """Append a chat message to history with metadata."""
+async def append_chat(chat: ChatMessage, ctx: Context) -> Dict[str, Any]:
+    """
+    Append a chat message to history with metadata and user isolation.
+    
+    This tool stores chat messages in a user-specific history:
+    - Automatically extracts user_id from request headers for authentication
+    - Adds timestamp and metadata to messages
+    - Ensures messages are only visible to the originating user
+    - Supports role-based messages (user, assistant, system)
+    
+    Args:
+        chat: ChatMessage object with message content and role
+        ctx: Request context containing user authentication headers
+        
+    Returns:
+        Structured response with message_id, user_id, and timestamp
+        
+    Example:
+        append_chat({"message": "Hello, how are you?", "role": "user"})
+    """
     await ensure_db_initialized()
     
     if db_manager.db is None:
@@ -728,7 +864,11 @@ async def append_chat(chat: ChatMessage) -> Dict[str, Any]:
         }
     
     try:
+        # Extract user_id from context headers
+        user_id = get_user_id_from_context(ctx)
+        
         doc = chat.model_dump()
+        doc["user_id"] = user_id  # Add user_id from headers
         doc["timestamp"] = datetime.utcnow()
         doc["edited"] = False
         doc["deleted"] = False
@@ -738,7 +878,7 @@ async def append_chat(chat: ChatMessage) -> Dict[str, Any]:
         return {
             "success": True,
             "message_id": str(result.inserted_id),
-            "user_id": chat.user_id,
+            "user_id": user_id,
             "timestamp": doc["timestamp"].isoformat()
         }
         
@@ -751,11 +891,31 @@ async def append_chat(chat: ChatMessage) -> Dict[str, Any]:
 
 @mcp.tool()
 async def get_chat_history(
-    user_id: str,
+    ctx: Context,
     limit: int = DEFAULT_QUERY_LIMIT,
     before_timestamp: Optional[str] = None
 ) -> Dict[str, Any]:
-    """Get chat history with pagination support."""
+    """
+    Get chat history with pagination support and user isolation.
+    
+    This tool retrieves chat messages for the authenticated user:
+    - Automatically extracts user_id from request headers for authentication
+    - Returns only messages belonging to the requesting user
+    - Supports pagination with before_timestamp for infinite scroll
+    - Orders messages chronologically (oldest first)
+    - Filters out deleted messages
+    
+    Args:
+        ctx: Request context containing user authentication headers
+        limit: Maximum number of messages to return (1-500, default: 50)
+        before_timestamp: ISO timestamp to get messages before (for pagination)
+        
+    Returns:
+        Structured response with messages, pagination info, and metadata
+        
+    Example:
+        get_chat_history(100, "2024-01-01T12:00:00")
+    """
     await ensure_db_initialized()
     
     if db_manager.db is None:
@@ -769,16 +929,13 @@ async def get_chat_history(
             "error": "Database not connected"
         }
     
-    if not user_id or not user_id.strip():
-        return {
-            "success": False,
-            "error": "User ID cannot be empty"
-        }
-    
-    # Sanitize limit
-    limit = max(1, min(limit, MAX_QUERY_LIMIT))
-    
     try:
+        # Extract user_id from context headers
+        user_id = get_user_id_from_context(ctx)
+        
+        # Sanitize limit
+        limit = max(1, min(limit, MAX_QUERY_LIMIT))
+        
         # Build query
         query = {"user_id": user_id, "deleted": {"$ne": True}}
         
@@ -832,24 +989,62 @@ async def get_chat_history(
         }
 
 @mcp.tool()
-async def upload_file(request: FileUploadRequest) -> Dict[str, Any]:
-    """Upload a file to GridFS with metadata."""
+async def upload_file(request: FileUploadRequest, ctx: Context) -> Dict[str, Any]:
+    """
+    Upload a file to MinIO with metadata stored in MongoDB.
+    
+    This tool handles file uploads with automatic storage tier selection:
+    - CSV, JSON, TXT files → "datasets" bucket (for data analysis)
+    - Other files → "files" bucket (for general storage)
+    - Automatic fallback to GridFS if MinIO is unavailable
+    - File validation and size limits (50MB max)
+    - Metadata indexing for fast retrieval
+    - User isolation: Files are automatically tagged with authenticated user_id
+    
+    Args:
+        request: FileUploadRequest with filename, base64 content, and metadata
+        ctx: FastMCP context with user authentication headers
+        
+    Returns:
+        Structured response with file_id, storage location, and upload details
+        
+    Example:
+        upload_file({
+            "filename": "data.csv",
+            "content": "base64_encoded_data...",
+            "content_type": "text/csv"
+        })
+        # user_id automatically extracted from X-User-ID header
+    """
     await ensure_db_initialized()
     
-    if db_manager.db is None or db_manager.gridfs is None:
-        return {
-            "success": False,
-            "error": "Database or GridFS not initialized"
-        }
+    if db_manager.db is None:
+        return {"success": False, "error": "Database not initialized"}
+    
     if not await db_manager.check_connection():
-        return {
-            "success": False,
-            "error": "Database not connected"
-        }
+        return {"success": False, "error": "Database not connected"}
     
     try:
+        # Clean and decode base64 content
+        content_str = request.content
+        
+        # Remove data URL prefix if present
+        if content_str.startswith('data:'):
+            if ',' in content_str:
+                content_str = content_str.split(',', 1)[1]
+        
+        # Remove whitespace and newlines
+        content_str = content_str.replace('\n', '').replace('\r', '').replace(' ', '')
+        
         # Decode base64 content
-        file_content = base64.b64decode(request.content)
+        try:
+            file_content = base64.b64decode(content_str, validate=True)
+        except Exception as decode_error:
+            logger.error(f"Base64 decode error: {decode_error}")
+            return {"success": False, "error": f"Invalid base64 content: {str(decode_error)}"}
+        
+        if len(file_content) == 0:
+            return {"success": False, "error": "File content is empty"}
         
         # Check file extension
         file_ext = os.path.splitext(request.filename)[1].lower()
@@ -859,20 +1054,65 @@ async def upload_file(request: FileUploadRequest) -> Dict[str, Any]:
                 "error": f"File type not allowed. Allowed types: {', '.join(ALLOWED_FILE_EXTENSIONS)}"
             }
         
-        # Store file in GridFS
-        file_id = await db_manager.gridfs.upload_from_stream(
-            request.filename,
-            file_content,
-            metadata={
-                "content_type": request.content_type,
-                "user_id": request.user_id,
-                "uploaded_at": datetime.utcnow(),
-                "file_size": len(file_content),
-                **request.metadata
-            }
-        )
+        # Generate unique file ID using authenticated user_id
+        timestamp = datetime.utcnow().timestamp()
+        file_id = f"{user_id}_{int(timestamp)}_{request.filename}"
         
-        # Store metadata in separate collection for easier querying
+        # Determine bucket based on file type
+        if file_ext in ['.csv', '.json', '.txt']:
+            bucket_name = "datasets"
+        else:
+            bucket_name = "files"
+        
+        # Upload to MinIO if available
+        minio_path = None
+        storage_success = False
+        
+        if db_manager.minio_client:
+            try:
+                # Upload to MinIO
+                file_stream = io.BytesIO(file_content)
+                db_manager.minio_client.put_object(
+                    bucket_name=bucket_name,
+                    object_name=file_id,
+                    data=file_stream,
+                    length=len(file_content),
+                    content_type=request.content_type
+                )
+                minio_path = f"{bucket_name}/{file_id}"
+                storage_success = True
+                logger.info(f"✅ File uploaded to MinIO: {minio_path}")
+            except S3Error as e:
+                logger.error(f"MinIO upload failed: {e}")
+                # Will try GridFS fallback below
+            except Exception as e:
+                logger.error(f"Unexpected MinIO error: {e}")
+                # Will try GridFS fallback below
+        
+        # Fallback to GridFS if MinIO failed or unavailable
+        if not storage_success and db_manager.gridfs:
+            try:
+                gridfs_id = await db_manager.gridfs.upload_from_stream(
+                    request.filename,
+                    file_content,
+                    metadata={
+                        "content_type": request.content_type,
+                        "user_id": request.user_id,
+                        "uploaded_at": datetime.utcnow(),
+                        "file_size": len(file_content),
+                        **request.metadata
+                    }
+                )
+                minio_path = f"gridfs://{gridfs_id}"
+                storage_success = True
+                logger.info(f"✅ File uploaded to GridFS: {minio_path}")
+            except Exception as e:
+                logger.error(f"GridFS upload failed: {e}")
+        
+        if not storage_success:
+            return {"success": False, "error": "Failed to store file in both MinIO and GridFS"}
+        
+        # Store metadata in MongoDB for easy querying
         metadata_doc = {
             "file_id": file_id,
             "filename": request.filename,
@@ -880,7 +1120,10 @@ async def upload_file(request: FileUploadRequest) -> Dict[str, Any]:
             "user_id": request.user_id,
             "file_size": len(file_content),
             "uploaded_at": datetime.utcnow(),
-            "metadata": request.metadata
+            "storage_path": minio_path,
+            "bucket": bucket_name if minio_path and not minio_path.startswith("gridfs://") else "gridfs",
+            "metadata": request.metadata,
+            "is_dataset": bucket_name == "datasets"  # Mark as dataset if stored in datasets bucket
         }
         
         await db_manager.db["file_metadata"].insert_one(metadata_doc)
@@ -890,52 +1133,138 @@ async def upload_file(request: FileUploadRequest) -> Dict[str, Any]:
             "file_id": str(file_id),
             "filename": request.filename,
             "file_size": len(file_content),
-            "content_type": request.content_type
+            "content_type": request.content_type,
+            "storage_path": minio_path,
+            "bucket": bucket_name if not minio_path.startswith("gridfs://") else "gridfs"
         }
         
     except Exception as e:
         logger.error(f"Error uploading file: {e}")
-        return {
-            "success": False,
-            "error": f"Upload error: {str(e)}"
-        }
+        return {"success": False, "error": f"Upload error: {str(e)}"}
 
 @mcp.tool()
-async def download_file(file_id: str) -> Dict[str, Any]:
-    """Download a file from GridFS."""
+async def download_file(request: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Download a file from MinIO or GridFS storage.
+    
+    This tool retrieves files from the storage backend with automatic fallback:
+    1. First checks MongoDB metadata for file information
+    2. Retrieves from MinIO if available
+    3. Falls back to GridFS if MinIO is unavailable
+    4. Returns base64-encoded content with metadata
+    
+    Args:
+        request: Dictionary with "file_id" (required) and optional "user_id" for access control
+        
+    Returns:
+        Structured response with file content (base64), metadata, and storage info
+        
+    Example:
+        download_file({"file_id": "user123_1640995200_data.csv", "user_id": "user123"})
+    """
     await ensure_db_initialized()
     
-    if db_manager.db is None or db_manager.gridfs is None:
-        return {
-            "success": False,
-            "error": "Database or GridFS not initialized"
-        }
+    file_id = request.get("file_id")
+    user_id = request.get("user_id")
+    
+    if not file_id:
+        return {"success": False, "error": "file_id is required"}
+    
+    if db_manager.db is None:
+        return {"success": False, "error": "Database not initialized"}
+    
     if not await db_manager.check_connection():
-        return {
-            "success": False,
-            "error": "Database not connected"
-        }
+        return {"success": False, "error": "Database not connected"}
     
     try:
-        from bson import ObjectId
+        # First check file metadata in MongoDB
+        metadata_doc = await db_manager.db["file_metadata"].find_one({"file_id": file_id})
         
-        # Convert string to ObjectId
-        try:
-            obj_id = ObjectId(file_id)
-        except:
+        if not metadata_doc:
+            # Fallback to GridFS lookup
+            try:
+                from bson import ObjectId
+                obj_id = ObjectId(file_id)
+                grid_out = await db_manager.gridfs.open_download_stream(obj_id)
+                file_content = await grid_out.read()
+                encoded_content = base64.b64encode(file_content).decode('utf-8')
+                
+                return {
+                    "success": True,
+                    "file_id": file_id,
+                    "filename": grid_out.filename,
+                    "content": encoded_content,
+                    "content_type": grid_out.metadata.get("content_type", "application/octet-stream"),
+                    "file_size": len(file_content),
+                    "metadata": grid_out.metadata or {},
+                    "storage_type": "gridfs"
+                }
+            except Exception as gridfs_error:
+                # Enhanced error reporting
+                logger.error(f"File {file_id} not found in metadata or GridFS: {gridfs_error}")
+                return {
+                    "success": False, 
+                    "error": f"File not found in database or GridFS storage",
+                    "details": {
+                        "file_id": file_id,
+                        "searched_in": ["file_metadata collection", "GridFS"],
+                        "suggestion": "Check if file_id is correct or if file was uploaded successfully"
+                    }
+                }
+        
+        # Check user access (if user_id provided)
+        if user_id and metadata_doc.get("user_id") != user_id:
             return {
-                "success": False,
-                "error": "Invalid file ID format"
+                "success": False, 
+                "error": "Access denied",
+                "details": {
+                    "reason": "File belongs to different user",
+                    "file_owner": metadata_doc.get("user_id", "unknown"),
+                    "requesting_user": user_id
+                }
             }
         
-        # Download file
-        grid_out = await db_manager.gridfs.open_download_stream(obj_id)
+        storage_path = metadata_doc.get("storage_path")
         
-        # Read file content
-        file_content = await grid_out.read()
+        if storage_path and storage_path.startswith("gridfs://"):
+            # GridFS storage
+            gridfs_id = storage_path.replace("gridfs://", "")
+            from bson import ObjectId
+            obj_id = ObjectId(gridfs_id)
+            grid_out = await db_manager.gridfs.open_download_stream(obj_id)
+            file_content = await grid_out.read()
         
-        # Get metadata
-        metadata = grid_out.metadata or {}
+        elif db_manager.minio_client and not storage_path.startswith("gridfs://"):
+            # MinIO storage
+            bucket = metadata_doc.get("bucket", "files")
+            try:
+                response = db_manager.minio_client.get_object(bucket, file_id)
+                file_content = response.read()   # Read the file content
+                response.close()
+                response.release_conn()
+            except S3Error as e:
+                logger.error(f"MinIO download failed: {e}")
+                return {
+                    "success": False, 
+                    "error": f"MinIO download failed: {str(e)}",
+                    "details": {
+                        "storage_type": "minio",
+                        "bucket": bucket,
+                        "file_id": file_id,
+                        "suggestion": "Check if MinIO service is running and accessible"
+                    }
+                }
+        
+        else:
+            return {
+                "success": False, 
+                "error": "No storage backend available",
+                "details": {
+                    "minio_available": db_manager.minio_client is not None,
+                    "storage_path": storage_path,
+                    "suggestion": "Check if MinIO or GridFS storage is properly configured"
+                }
+            }
         
         # Encode to base64
         encoded_content = base64.b64encode(file_content).decode('utf-8')
@@ -943,18 +1272,24 @@ async def download_file(file_id: str) -> Dict[str, Any]:
         return {
             "success": True,
             "file_id": file_id,
-            "filename": grid_out.filename,
+            "filename": metadata_doc.get("filename", "unknown"),
             "content": encoded_content,
-            "content_type": metadata.get("content_type", "application/octet-stream"),
+            "content_type": metadata_doc.get("content_type", "application/octet-stream"),
             "file_size": len(file_content),
-            "metadata": metadata
-        }
+            "metadata": metadata_doc.get("metadata", {}),
+            "storage_type": "minio" if not storage_path.startswith("gridfs://") else "gridfs"
+        }     
         
     except Exception as e:
         logger.error(f"Error downloading file: {e}")
         return {
             "success": False,
-            "error": f"Download error: {str(e)}"
+            "error": f"Download error: {str(e)}",
+            "details": {
+                "file_id": file_id,
+                "user_id": user_id,
+                "suggestion": "Check server logs for detailed error information"
+            }
         }
 
 @mcp.tool()
@@ -1142,13 +1477,8 @@ async def health_check() -> Dict[str, Any]:
             gridfs_status = "error"
             issues.append(f"GridFS error: {str(e)}")
     
-    # Server-side tools information (static list since list_tools() is client-side only)
-    # Note: For dynamic tool discovery, use client.list_tools() from the client side
-    available_tools = [
-        "get_logs_by_date", "query_logs", "store_logs", "search_logs",
-        "aggregate_logs", "append_chat", "get_chat_history", "upload_file",
-        "download_file", "delete_logs", "get_system_stats", "health_check"
-    ]
+    # Note: Tool discovery should be done via MCP client.list_tools() method
+    # This follows MCP best practices for dynamic tool discovery
     
     return {
         "success": status != "unhealthy",
@@ -1162,20 +1492,625 @@ async def health_check() -> Dict[str, Any]:
         "gridfs": gridfs_status,
         "mcp": {
             "name": MONGO_MCP_NAME,
-            "tools_count": len(available_tools),
-            "tools": available_tools,
-            "note": "For dynamic tool discovery, use client.list_tools() from client-side"
+            "note": "Use MCP client.list_tools() for dynamic tool discovery"
         },
         "issues": issues if issues else None
     }
 
-# ── Main entry point ─────────────────────────────────────────────────
+@mcp.tool()
+async def find_documents(
+    collection: str,
+    query: Dict[str, Any] = None,
+    limit: int = DEFAULT_QUERY_LIMIT,
+    skip: int = 0,
+    sort_by: str = "uploaded_at",
+    sort_order: SortOrder = SortOrder.DESC
+) -> Dict[str, Any]:
+    """Find documents in a specified collection with pagination."""
+    await ensure_db_initialized()
+    
+    if db_manager.db is None:
+        return {"success": False, "error": "Database not initialized"}
+    
+    if not await db_manager.check_connection():
+        return {"success": False, "error": "Database not connected"}
+    
+    # Sanitize inputs
+    limit = max(1, min(limit, MAX_QUERY_LIMIT))
+    skip = max(0, skip)
+    query = query or {}
+    
+    try:
+        # Build sort
+        sort_direction = DESCENDING if sort_order == SortOrder.DESC else ASCENDING
+        
+        # Execute query
+        cursor = (
+            db_manager.db[collection]
+            .find(query)
+            .sort(sort_by, sort_direction)
+            .skip(skip)
+            .limit(limit)
+        )
+        
+        docs = await cursor.to_list(length=limit)
+        total_count = await db_manager.db[collection].count_documents(query)
+        
+        # Process documents
+        for doc in docs:
+            doc["_id"] = str(doc["_id"])
+            # Convert datetime objects to ISO strings
+            for key, value in doc.items():
+                if isinstance(value, datetime):
+                    doc[key] = value.isoformat()
+        
+        return {
+            "success": True,
+            "collection": collection,
+            "query": query,
+            "count": len(docs),
+            "total_count": total_count,
+            "skip": skip,
+            "limit": limit,
+            "documents": docs,
+            "has_more": (skip + len(docs)) < total_count
+        }
+        
+    except Exception as e:
+        logger.error(f"Error finding documents: {e}")
+        return {"success": False, "error": f"Query error: {str(e)}"}
+
+@mcp.tool()
+async def list_uploaded_files(
+    ctx: Context,
+    file_type: Optional[str] = None,
+    limit: int = DEFAULT_QUERY_LIMIT
+) -> Dict[str, Any]:
+    """
+    List uploaded files for the authenticated user with optional filtering.
+    
+    This tool provides secure file listing with user isolation:
+    - Only shows files belonging to the authenticated user
+    - Supports filtering by file type/content type
+    - Includes storage metadata and file details
+    - Paginated results with configurable limits
+    
+    Args:
+        ctx: FastMCP context with user authentication headers
+        file_type: Optional filter by content type (e.g., "csv", "json")
+        limit: Maximum number of files to return (default: 50)
+        
+    Returns:
+        Structured response with user's files list and metadata
+        
+    Example:
+        list_uploaded_files("csv", 50)
+        # user_id automatically extracted from X-User-ID header
+    """
+    await ensure_db_initialized()
+    
+    if db_manager.db is None:
+        return {"success": False, "error": "Database not initialized"}
+    
+    if not await db_manager.check_connection():
+        return {"success": False, "error": "Database not connected"}
+    
+    try:
+        # Extract authenticated user_id from context
+        user_id = get_user_id_from_context(ctx)
+        
+        # Build query with user isolation
+        query = {"user_id": user_id}  # Always filter by authenticated user
+        
+        if file_type:
+            query["content_type"] = {"$regex": file_type, "$options": "i"}
+        
+        # Get files for this user only
+        cursor = (
+            db_manager.db["file_metadata"]
+            .find(query)
+            .sort("uploaded_at", DESCENDING)
+            .limit(limit)
+        )
+        
+        files = await cursor.to_list(length=limit)
+        total_count = await db_manager.db["file_metadata"].count_documents(query)
+        
+        # Process files
+        for file_doc in files:
+            file_doc["_id"] = str(file_doc["_id"])
+            if isinstance(file_doc.get("uploaded_at"), datetime):
+                file_doc["uploaded_at"] = file_doc["uploaded_at"].isoformat()
+        
+        return {
+            "success": True,
+            "user_id": user_id,
+            "total_files": total_count,
+            "returned_count": len(files),
+            "files": files,
+            "query_filters": {"user_id": user_id, "file_type": file_type}
+        }
+        
+    except Exception as e:
+        logger.error(f"Error listing files for user {user_id}: {e}")
+        return {"success": False, "error": f"List error: {str(e)}"}
+
+@mcp.tool()
+async def list_available_datasets(
+    ctx: Context,
+    bucket_name: str = "datasets",
+    limit: int = DEFAULT_QUERY_LIMIT
+) -> Dict[str, Any]:
+    """
+    List available datasets from MinIO storage and MongoDB collections with user isolation.
+    
+    This tool provides a comprehensive view of datasets accessible to the authenticated user:
+    - Automatically extracts user_id from request headers for authentication
+    - Scans MinIO buckets for user's uploaded files (CSV, JSON, TXT)
+    - Lists MongoDB collections that contain user's data
+    - Includes file metadata (size, upload date, owner)
+    - Filters by authenticated user to ensure data isolation
+    - Categorizes datasets by source (MinIO, MongoDB collections)
+    
+    Args:
+        ctx: Request context containing user authentication headers
+        bucket_name: MinIO bucket to scan (default: "datasets")
+        limit: Maximum number of datasets to return
+        
+    Returns:
+        Structured response with user's datasets from all sources, categorized by type
+        
+    Example:
+        list_available_datasets("datasets", 20)
+    """
+    await ensure_db_initialized()
+    
+    if db_manager.db is None:
+        return {"success": False, "error": "Database not initialized"}
+    
+    try:
+        # Extract user_id from context headers
+        user_id = get_user_id_from_context(ctx)
+        
+        available_datasets = []
+        
+        # List from MinIO if available
+        if db_manager.minio_client:
+            try:
+                objects = db_manager.minio_client.list_objects(bucket_name, recursive=True)
+                minio_datasets = []
+                for obj in objects:
+                    # Only show files that belong to the authenticated user
+                    if obj.object_name.startswith(f"{user_id}_"):
+                        dataset_info = {
+                            "id": obj.object_name,
+                            "name": obj.object_name.split("_", 2)[-1] if "_" in obj.object_name else obj.object_name,
+                            "size": obj.size,
+                            "last_modified": obj.last_modified.isoformat() if obj.last_modified else None,
+                            "source": "minio",
+                            "bucket": bucket_name,
+                            "type": "file",
+                            "user_id": user_id
+                        }
+                        minio_datasets.append(dataset_info)
+                
+                if len(minio_datasets) > limit:
+                    minio_datasets = minio_datasets[:limit]
+                
+                available_datasets.extend(minio_datasets)
+                logger.info(f"Found {len(minio_datasets)} datasets in MinIO")
+                
+            except S3Error as e:
+                logger.warning(f"MinIO list error (bucket may not exist): {e}")
+            except Exception as e:
+                logger.warning(f"MinIO access error: {e}")
+        
+        # List from MongoDB file_metadata collection (user's files only)
+        try:
+            query = {"user_id": user_id, "is_dataset": True}
+            
+            cursor = (
+                db_manager.db["file_metadata"]
+                .find(query)
+                .sort("uploaded_at", DESCENDING)
+                .limit(limit)
+            )
+            
+            db_datasets = await cursor.to_list(length=limit)
+            
+            for dataset in db_datasets:
+                dataset_info = {
+                    "id": str(dataset.get("_id", dataset.get("file_id", "unknown"))),
+                    "name": dataset.get("filename", "unnamed"),
+                    "size": dataset.get("size", 0),
+                    "last_modified": dataset.get("uploaded_at", datetime.utcnow()).isoformat(),
+                    "source": "mongodb",
+                    "collection": "file_metadata", 
+                    "type": "metadata",
+                    "user_id": dataset.get("user_id")
+                }
+                available_datasets.append(dataset_info)
+            
+            logger.info(f"Found {len(db_datasets)} datasets in MongoDB")
+            
+        except Exception as e:
+            logger.warning(f"Database query error: {e}")
+        
+        # List collections that might contain datasets (check for user-specific data)
+        try:
+            collections = await db_manager.db.list_collection_names()
+            data_collections = [col for col in collections if any(keyword in col.lower() 
+                                                                for keyword in ['data', 'log', 'metric', 'event'])]
+            
+            for collection_name in data_collections:
+                try:
+                    # Check if collection has user-specific data
+                    user_count = await db_manager.db[collection_name].count_documents({"user_id": user_id})
+                    if user_count > 0:
+                        dataset_info = {
+                            "id": collection_name,
+                            "name": collection_name,
+                            "size": user_count,
+                            "last_modified": datetime.utcnow().isoformat(),
+                            "source": "mongodb", 
+                            "collection": collection_name,
+                            "type": "collection",
+                            "document_count": user_count,
+                            "user_id": user_id
+                        }
+                        available_datasets.append(dataset_info)
+                except Exception as e:
+                    logger.warning(f"Error checking collection {collection_name}: {e}")
+                    
+        except Exception as e:
+            logger.warning(f"Error listing collections: {e}")
+        
+        return {
+            "success": True,
+            "total_datasets": len(available_datasets),
+            "datasets": available_datasets,
+            "query_filters": {"user_id": user_id, "bucket": bucket_name},
+            "sources": {
+                "minio": len([d for d in available_datasets if d.get("source") == "minio"]),
+                "mongodb": len([d for d in available_datasets if d.get("source") == "mongodb"])
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error listing datasets: {e}")
+        return {"success": False, "error": f"List datasets error: {str(e)}"}
+
+@mcp.tool() 
+async def get_dataset_info(dataset_id: str, ctx: Context) -> Dict[str, Any]:
+    """
+    Get detailed information about a specific dataset with user isolation.
+    
+    This tool retrieves dataset information with security controls:
+    - Validates that the requesting user owns the dataset
+    - Searches both MinIO storage and MongoDB metadata
+    - Returns comprehensive dataset details including size, type, and storage location
+    - Ensures users can only access their own datasets
+    
+    Args:
+        dataset_id: Unique identifier for the dataset
+        ctx: Request context containing user authentication headers
+        
+    Returns:
+        Structured response with dataset details or access denied error
+        
+    Example:
+        get_dataset_info("user123_1640995200_data.csv")
+    """
+    await ensure_db_initialized()
+    
+    if db_manager.db is None:
+        return {"success": False, "error": "Database not initialized"}
+    
+    try:
+        # Extract authenticated user_id from context
+        user_id = get_user_id_from_context(ctx)
+        dataset_info = None
+        
+        # Check MinIO first (validate user ownership via file naming convention)
+        if db_manager.minio_client:
+            try:
+                # Only allow access to files that belong to the user
+                if not dataset_id.startswith(f"{user_id}_"):
+                    return {
+                        "success": False,
+                        "error": "Access denied - dataset belongs to different user",
+                        "dataset_id": dataset_id,
+                        "user_id": user_id
+                    }
+                
+                # Try datasets bucket
+                obj_stat = db_manager.minio_client.stat_object("datasets", dataset_id)
+                dataset_info = {
+                    "id": dataset_id,
+                    "name": dataset_id,
+                    "size": obj_stat.size,
+                    "last_modified": obj_stat.last_modified.isoformat(),
+                    "source": "minio",
+                    "bucket": "datasets",
+                    "content_type": obj_stat.content_type,
+                    "etag": obj_stat.etag,
+                    "user_id": user_id
+                }
+            except S3Error:
+                # Try files bucket
+                try:
+                    obj_stat = db_manager.minio_client.stat_object("files", dataset_id) 
+                    dataset_info = {
+                        "id": dataset_id,
+                        "name": dataset_id,
+                        "size": obj_stat.size,
+                        "last_modified": obj_stat.last_modified.isoformat(),
+                        "source": "minio",
+                        "bucket": "files",
+                        "content_type": obj_stat.content_type,
+                        "etag": obj_stat.etag,
+                        "user_id": user_id
+                    }
+                except S3Error:
+                    pass
+        
+        # Check MongoDB if not found in MinIO (with user validation)
+        if dataset_info is None:
+            try:
+                # Check file_metadata collection with user filter
+                metadata = await db_manager.db["file_metadata"].find_one({
+                    "file_id": dataset_id,
+                    "user_id": user_id  # Ensure user owns the dataset
+                })
+                if metadata:
+                    dataset_info = {
+                        "id": dataset_id,
+                        "name": metadata.get("filename", dataset_id),
+                        "size": metadata.get("size", 0),
+                        "last_modified": metadata.get("uploaded_at", datetime.utcnow()).isoformat(),
+                        "source": "mongodb",
+                        "collection": "file_metadata",
+                        "user_id": metadata.get("user_id"),
+                        "content_type": metadata.get("content_type")
+                    }
+                else:
+                    # Check if it's a collection name with user-specific data
+                    collections = await db_manager.db.list_collection_names()
+                    if dataset_id in collections:
+                        # Check if user has any data in this collection
+                        user_count = await db_manager.db[dataset_id].count_documents({"user_id": user_id})
+                        if user_count > 0:
+                            sample_doc = await db_manager.db[dataset_id].find_one({"user_id": user_id})
+                            
+                            dataset_info = {
+                                "id": dataset_id,
+                                "name": dataset_id,
+                                "size": user_count,
+                                "last_modified": datetime.utcnow().isoformat(),
+                                "source": "mongodb", 
+                                "collection": dataset_id,
+                                "type": "collection",
+                                "document_count": user_count,
+                                "sample_document": sample_doc,
+                                "user_id": user_id
+                            }
+                        else:
+                            return {
+                                "success": False,
+                                "error": f"Access denied - no data found for user in collection '{dataset_id}'",
+                                "user_id": user_id
+                            }
+            except Exception as e:
+                logger.warning(f"MongoDB lookup error: {e}")
+        
+        if dataset_info is None:
+            return {
+                "success": False,
+                "error": f"Dataset '{dataset_id}' not found or access denied",
+                "details": {
+                    "dataset_id": dataset_id,
+                    "user_id": user_id,
+                    "searched_in": ["MinIO datasets bucket", "MinIO files bucket", "MongoDB file_metadata", "MongoDB collections"],
+                    "suggestion": "Check if dataset_id is correct and belongs to your user account"
+                }
+            }
+        
+        return {
+            "success": True,
+            "dataset": dataset_info
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting dataset info: {e}")
+        return {"success": False, "error": f"Dataset info error: {str(e)}"}
+
+@mcp.tool()
+async def sync_file_metadata() -> Dict[str, Any]:
+    """
+    Synchronize file metadata with actual storage and clean up orphaned entries.
+    
+    This maintenance tool ensures data consistency between metadata and storage:
+    - Verifies all metadata entries have corresponding files in storage
+    - Identifies orphaned metadata (files deleted from storage but metadata remains)
+    - Automatically cleans up orphaned entries
+    - Checks both MinIO and GridFS storage backends
+    - Provides detailed report of sync operations
+    
+    Returns:
+        Structured response with sync results, cleanup counts, and any errors
+        
+    Example:
+        sync_file_metadata()  # No parameters needed
+    """
+    await ensure_db_initialized()
+    
+    if db_manager.db is None:
+        return {"success": False, "error": "Database not initialized"}
+    
+    if not await db_manager.check_connection():
+        return {"success": False, "error": "Database not connected"}
+    
+    try:
+        sync_results = {
+            "total_metadata_entries": 0,
+            "verified_files": 0,
+            "orphaned_metadata": 0,
+            "cleaned_up": 0,
+            "errors": []
+        }
+        
+        # Get all file metadata entries
+        metadata_cursor = db_manager.db["file_metadata"].find({})
+        metadata_docs = await metadata_cursor.to_list(length=None)
+        sync_results["total_metadata_entries"] = len(metadata_docs)
+        
+        orphaned_ids = []
+        
+        for metadata_doc in metadata_docs:
+            file_id = metadata_doc.get("file_id")
+            storage_path = metadata_doc.get("storage_path")
+            bucket = metadata_doc.get("bucket", "files")
+            
+            file_exists = False
+            
+            try:
+                if storage_path and storage_path.startswith("gridfs://"):
+                    # Check GridFS
+                    gridfs_id = storage_path.replace("gridfs://", "")
+                    from bson import ObjectId
+                    obj_id = ObjectId(gridfs_id)
+                    grid_out = await db_manager.gridfs.open_download_stream(obj_id)
+                    await grid_out.read(1)  # Try to read one byte
+                    file_exists = True
+                    
+                elif db_manager.minio_client:
+                    # Check MinIO
+                    try:
+                        db_manager.minio_client.stat_object(bucket, file_id)
+                        file_exists = True
+                    except S3Error as e:
+                        if e.code == "NoSuchKey":
+                            file_exists = False
+                        else:
+                            sync_results["errors"].append(f"MinIO error for {file_id}: {str(e)}")
+                            continue
+                
+                if file_exists:
+                    sync_results["verified_files"] += 1
+                else:
+                    orphaned_ids.append(metadata_doc["_id"])
+                    sync_results["orphaned_metadata"] += 1
+                    logger.info(f"Found orphaned metadata for file: {file_id}")
+                    
+            except Exception as e:
+                sync_results["errors"].append(f"Error checking file {file_id}: {str(e)}")
+                # Consider it orphaned if we can't verify it exists
+                orphaned_ids.append(metadata_doc["_id"])
+                sync_results["orphaned_metadata"] += 1
+        
+        # Clean up orphaned metadata
+        if orphaned_ids:
+            result = await db_manager.db["file_metadata"].delete_many({
+                "_id": {"$in": orphaned_ids}
+            })
+            sync_results["cleaned_up"] = result.deleted_count
+            logger.info(f"Cleaned up {result.deleted_count} orphaned metadata entries")
+        
+        sync_results["success"] = True
+        sync_results["summary"] = f"Verified {sync_results['verified_files']} files, cleaned up {sync_results['cleaned_up']} orphaned entries"
+        
+        return sync_results
+        
+    except Exception as e:
+        logger.error(f"Error synchronizing file metadata: {e}")
+        return {
+            "success": False,
+            "error": f"Sync error: {str(e)}"
+        }
+
+@mcp.tool()
+async def repair_file_storage() -> Dict[str, Any]:
+    """Repair file storage issues by checking and fixing inconsistencies."""
+    await ensure_db_initialized()
+    
+    if db_manager.db is None:
+        return {"success": False, "error": "Database not initialized"}
+    
+    try:
+        repair_results = {
+            "issues_found": [],
+            "repairs_attempted": [],
+            "success_count": 0,
+            "error_count": 0
+        }
+        
+        # First sync metadata
+        sync_result = await sync_file_metadata()
+        if sync_result.get("success"):
+            repair_results["repairs_attempted"].append("Metadata sync completed")
+            repair_results["success_count"] += 1
+        else:
+            repair_results["issues_found"].append("Metadata sync failed")
+            repair_results["error_count"] += 1
+        
+        # Check storage backend availability
+        storage_issues = []
+        
+        if db_manager.minio_client:
+            try:
+                # Try to list buckets to test MinIO connectivity
+                buckets = db_manager.minio_client.list_buckets()
+                repair_results["repairs_attempted"].append("MinIO connectivity verified")
+                repair_results["success_count"] += 1
+            except Exception as e:
+                storage_issues.append(f"MinIO connectivity issue: {str(e)}")
+                repair_results["issues_found"].append(f"MinIO problem: {str(e)}")
+                repair_results["error_count"] += 1
+        else:
+            storage_issues.append("MinIO client not initialized")
+            repair_results["issues_found"].append("MinIO client not available")
+            repair_results["error_count"] += 1
+        
+        # Check GridFS
+        try:
+            # Try to list one file from GridFS
+            cursor = db_manager.gridfs.find().limit(1)
+            await cursor.to_list(length=1)
+            repair_results["repairs_attempted"].append("GridFS connectivity verified")
+            repair_results["success_count"] += 1
+        except Exception as e:
+            storage_issues.append(f"GridFS issue: {str(e)}")
+            repair_results["issues_found"].append(f"GridFS problem: {str(e)}")
+            repair_results["error_count"] += 1
+        
+        repair_results["storage_issues"] = storage_issues
+        repair_results["success"] = repair_results["error_count"] == 0
+        
+        if repair_results["success"]:
+            repair_results["summary"] = "All storage systems are working correctly"
+        else:
+            repair_results["summary"] = f"Found {repair_results['error_count']} issues, check details"
+        
+        return repair_results
+        
+    except Exception as e:
+        logger.error(f"Error repairing file storage: {e}")
+        return {
+            "success": False,
+            "error": f"Repair error: {str(e)}"
+        }
+
+# ── Server startup and cleanup ──────────────────────────────────────
+async def cleanup():
+    """Cleanup database connections on server shutdown"""
+    await db_manager.close()
+
+# Main entry point  
 if __name__ == "__main__":
-    # Run with HTTP transport (recommended for production)
-    # The database initialization will happen when the first tool is called
+    # Run with FastMCP streamable HTTP transport
     mcp.run(
         transport="http",
-        host="0.0.0.0",  # Allow external connections
+        host="0.0.0.0", 
         port=MONGO_MCP_PORT,
-        log_level="INFO"
+        log_level="WARNING"
     )

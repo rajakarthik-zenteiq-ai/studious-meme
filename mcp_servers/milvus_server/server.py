@@ -56,7 +56,29 @@ class InsertVectors(BaseModel):
 # Tool definitions
 @mcp.tool()
 async def search_similar(query: VectorQuery) -> Dict[str, Any]:
-    """Search for similar vectors in Milvus collection."""
+    """
+    Search for similar vectors in Milvus collection using semantic similarity.
+    
+    This tool performs high-performance vector similarity search using Milvus:
+    - Supports multiple distance metrics (L2, IP, COSINE)
+    - Configurable search parameters and result limits
+    - Returns similarity scores and associated metadata
+    - Automatic collection loading and optimization
+    
+    Args:
+        query: VectorQuery object with query_vector, collection_name, top_k, and search_params
+        
+    Returns:
+        Structured response with similar vectors, distances, and metadata
+        
+    Example:
+        search_similar({
+            "query_vector": [0.1, 0.2, ...],
+            "collection_name": "documents", 
+            "top_k": 10,
+            "search_params": {"metric_type": "L2"}
+        })
+    """
     if not milvus_connected:
         return {
             "success": False,
@@ -205,12 +227,10 @@ async def health_check() -> Dict[str, Any]:
 
 # Main entry point
 if __name__ == "__main__":
-    logger.info(f"Starting Milvus MCP Server on port {MILVUS_MCP_PORT}")
-    
     # Run with FastMCP streamable HTTP transport
     mcp.run(
         transport="http",
         host="0.0.0.0",
         port=MILVUS_MCP_PORT,
-        log_level="INFO"
+        log_level="WARNING"
     )

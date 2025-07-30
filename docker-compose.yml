@@ -34,6 +34,9 @@ services:
     environment:
       - MINIO_ACCESS_KEY=minioadmin
       - MINIO_SECRET_KEY=minioadmin
+    ports:
+      - "9000:9000"
+      - "9001:9001"
     volumes:
       - minio_data:/data
     command: server /data --console-address ":9001"
@@ -73,11 +76,11 @@ services:
   # ── MCP Server Services ────────────────────────────────────────────
   mongo_server:
     build: 
-      context: ./mcp_servers/mongo_server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: mcp_servers/mongo_server/Dockerfile
     container_name: mongo_server
     ports:
-      - "8101:8101"
+      - "8100:8100"
     environment:
       - IS_DOCKER=true
       - PYTHONUNBUFFERED=1
@@ -86,44 +89,66 @@ services:
       - MONGO_MAX_POOL_SIZE=${MONGO_MAX_POOL_SIZE:-10}
       - MONGO_MIN_POOL_SIZE=${MONGO_MIN_POOL_SIZE:-1}
       - DEBUG=${DEBUG:-true}
+      - MONGO_MCP_PORT=8100
     depends_on:
       mongo:
         condition: service_healthy
+      minio:
+        condition: service_started
+    command: ["python", "/app/server.py", "--host", "0.0.0.0", "--port", "8100"]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8100/mcp/", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   milvus_server:
     build:
-      context: ./mcp_servers/milvus_server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: mcp_servers/milvus_server/Dockerfile
     container_name: milvus_server
     ports:
-      - "8102:8102"
+      - "8110:8110"
     environment:
       - IS_DOCKER=true
       - PYTHONUNBUFFERED=1
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
       - MILVUS_COLLECTION=${MILVUS_COLLECTION:-logs_embeddings}
+      - MILVUS_MCP_PORT=8110
       - DEBUG=${DEBUG:-true}
     depends_on:
       milvus:
         condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8110/mcp/", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   websearch_server:
     build:
-      context: ./mcp_servers/websearch_server
-      dockerfile: Dockerfile
+      context: .
+      dockerfile: mcp_servers/websearch_server/Dockerfile
     container_name: websearch_server
     ports:
-      - "8105:8105"
+      - "8140:8140"
     environment:
       - IS_DOCKER=true
       - PYTHONUNBUFFERED=1
       - OPENAI_API_KEY=${OPENAI_API_KEY}
       - SEARCH_MODEL=${SEARCH_MODEL:-gpt-4o-mini}
+      - WEBSEARCH_MCP_PORT=8140
       - DEBUG=${DEBUG:-true}
+    command: ["python", "/app/server.py"]
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8140/mcp/", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
   scirex_server:
     build:
@@ -131,16 +156,25 @@ services:
       dockerfile: mcp_servers/scirex_server/Dockerfile
     container_name: scirex_server
     ports:
-      - "8106:8106"
+      - "8150:8150"
     environment:
       - IS_DOCKER=true
       - PYTHONUNBUFFERED=1
       - SCIREX_DATA_DIR=/data/user_datasets
       - SCIREX_MODEL_DIR=/data/user_models
+      - SCIREX_MCP_PORT=8150
       - DEBUG=${DEBUG:-true}
     volumes:
       - scirex_data:/data
+    depends_on:
+      - mongo_server
+      - minio
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8150/mcp/", "||", "exit", "1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
 
 volumes:
   mongo_data:

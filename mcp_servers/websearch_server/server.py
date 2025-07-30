@@ -147,14 +147,32 @@ async def search_with_openai(query: str, limit: int = 10) -> List[Dict[str, Any]
 @mcp.tool()
 async def web_search(query: str, limit: int = 10) -> Dict[str, Any]:
     """
-    Perform a web search using OpenAI's search capabilities.
+    Perform intelligent web search using OpenAI's search capabilities.
+    
+    This tool leverages OpenAI's language model to search the web and return
+    relevant, structured results. It provides high-quality search results with
+    relevance scoring and comprehensive metadata.
+    
+    Features:
+    - Intelligent query understanding and expansion
+    - Relevance scoring for each result
+    - Real-time web content access
+    - Structured response format
+    - Automatic result validation and filtering
     
     Args:
-        query: Search query string
-        limit: Number of search results to return (default: 10, max: 20)
+        query: Search query string (e.g., "latest developments in AI", "Python best practices")
+        limit: Number of search results to return (1-20, default: 10)
         
     Returns:
-        Dictionary containing search results with success status, query, count, and results list
+        Structured response with search results including:
+        - title: Webpage title
+        - url: Full webpage URL
+        - snippet: Content summary/description
+        - relevance_score: Relevance to query (0.0-1.0)
+        
+    Example:
+        web_search("machine learning frameworks 2024", 5)
     """
     try:
         logger.info(f"Performing web search for: {query}")
@@ -191,7 +209,20 @@ async def web_search(query: str, limit: int = 10) -> Dict[str, Any]:
 
 @mcp.tool()
 async def health_check() -> Dict[str, Any]:
-    """Health check for the websearch server."""
+    """
+    Comprehensive health check for the websearch server.
+    
+    This tool verifies the operational status of all components:
+    - OpenAI API connectivity and authentication
+    - Search model availability and configuration
+    - Server responsiveness and resource availability
+    
+    Returns:
+        Detailed health status with component-level diagnostics
+        
+    Example:
+        health_check()  # No parameters needed
+    """
     
     # Check OpenAI status
     openai_status = "not_configured"
@@ -229,13 +260,10 @@ async def health_check() -> Dict[str, Any]:
 
 # Main entry point
 if __name__ == "__main__":
-    logger.info(f"Starting WebSearch MCP Server (OpenAI-powered) on port {WEBSEARCH_MCP_PORT}")
-    logger.info(f"Using OpenAI model: {SEARCH_MODEL}")
-    
     # Run with FastMCP streamable HTTP transport
     mcp.run(
         transport="http",
         host="0.0.0.0",
         port=WEBSEARCH_MCP_PORT,
-        log_level="INFO"
+        log_level="WARNING"
     )

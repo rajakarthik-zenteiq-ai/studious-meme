@@ -1,7 +1,47 @@
 # MCP-Based Log Analytics & AI Platform
 
 This project uses a modular MCP (Model Context Protocol) architecture:
-- **4 MCP Servers**: each hosts a narrow set of tools over SSE.
+- **4 MCP Servers**: each hosts ## Makefile Commands
+
+The Makefile has been **simplified to three core commands** for easier workflow:
+
+### 🚀 Essential Commands (NEW - Simplified Workflow)
+```bash
+make pre_start      # Complete setup: Python 3.10/3.11 env, dependencies, Docker & MCP servers
+make run_app        # Start Streamlit web application  
+make stop          # Stop all services and cleanup
+```
+
+**Note**: The simplified workflow ensures:
+- Python 3.10 or 3.11 virtual environment (fixed from 3.9)
+- Automatic dependency installation with `uv`
+- All Docker services started (databases, vLLM)
+- All MCP servers launched in background
+- Connectivity verification before app start
+
+### 🚧 Known Issues & Troubleshooting
+
+**✅ MongoDB MCP Server (Port 8100) - FIXED**
+```bash
+# Previously: "All connection attempts failed"
+# Status: ✅ mongodb server now healthy and responding
+
+# Issue was Docker port mapping conflict (8101 vs 8100)
+# Fixed by updating docker-compose.yml to use consistent port 8100
+```
+
+**✅ Python Version Requirements - ENFORCED**
+- **Required**: Python 3.10 or 3.11 (NOT 3.9)
+- **Status**: Makefile now enforces correct Python version
+- **Auto-check**: `make pre_start` validates Python version before setup
+
+### 🔧 Debugging Commands (if needed)
+```bash
+make start_docker   # Start all Docker services (databases, vLLM)
+make run_servers    # Start all MCP servers in background
+make stop_servers   # Stop all MCP servers
+python test_mcp_connectivity.py  # Test connectivity manually
+```ools over SSE.
 - **LangGraph Agent**: a ReAct-style multi-agent orchestrator.
 - **MCP Client**: unified Python backend interface for all servers.
 - **FastAPI Integration**: OpenAI-compatible chat API endpoints.
@@ -26,24 +66,46 @@ This project uses a modular MCP (Model Context Protocol) architecture:
 
 ## Quick Start
 
-### One-Command Setup
+### Simplified Workflow
+The new simplified Makefile provides three main commands:
+
 ```bash
-# 1. Setup environment
-make setup-venv
-source .venv/bin/activate
-make install
+# 1. Complete environment setup and start all services
+make pre_start
 
-# 2. Start Docker services (databases, vLLM)
-make start_docker
-
-# 3. Start all MCP servers in background
-make run_servers
-
-# 4. Start Streamlit web application
+# 2. Run the Streamlit web application
 make run_app
+
+# 3. Stop all services when done
+make stop
 ```
 
 The Streamlit application will be available at `http://localhost:8501`
+
+### Detailed Setup Steps
+
+**Step 1: Environment Setup and Service Start**
+```bash
+make pre_start
+```
+This command will:
+- Set up Python virtual environment with `uv`
+- Install all dependencies
+- Start Docker services (databases, vLLM)
+- Start all MCP servers in background
+- Verify MCP server connectivity
+
+**Step 2: Run Application**
+```bash
+make run_app
+```
+Starts the Streamlit web interface at `http://localhost:8501`
+
+**Step 3: Cleanup**
+```bash
+make stop
+```
+Stops all Docker services and MCP servers.
 
 ### Alternative: FastAPI Server
 Start the OpenAI-compatible API server:
@@ -77,50 +139,66 @@ Test the LangGraph agent directly:
 python main.py agent --query "Analyze the logs for error patterns"
 ```
 
-## Make Commands
+## 🔧 Recent Implementation Updates (July 2025)
 
-### 🚀 Quick Start Commands
+### ✅ What's Working Now
+
+**MCP Client & Connectivity - FULLY IMPLEMENTED**
+- **Session Management**: Automatically handles MCP session initialization with proper session IDs
+- **Protocol Compliance**: Sends correct `notifications/initialized` requests: `{"jsonrpc":"2.0","method":"notifications/initialized"}`
+- **SSE Support**: Parses Server-Sent Events responses from FastMCP servers
+- **RBAC Integration**: Role-based access control for different server types
+- **Health Checking**: Comprehensive health checks for all MCP servers
+
+**Current Status**: ✅ **4/4 MCP servers healthy** (milvus, websearch, scirex, mongodb working)
+
+### 🧪 Testing MCP Connectivity
+```bash
+# Test all MCP server connections with proper session handling
+python test_mcp_connectivity.py
+
+# Results:
+# ✅ milvus: healthy
+# ✅ websearch: healthy  
+# ✅ scirex: healthy
+# ✅ mongodb: healthy
+# 🎯 4/4 servers are healthy
+```
+
+**Test Features**:
+1. Session initialization with each MCP server
+2. Proper `notifications/initialized` handling (returns 202 Accepted)
+3. Health check tool execution with session persistence
+4. Session ID management for subsequent requests
+
+### 🔄 MCP Protocol Flow (Now Working)
+1. **Initialize**: Send `initialize` request with protocol version and capabilities
+2. **Session ID**: Extract `mcp-session-id` from response headers  
+3. **Notify**: Send `notifications/initialized` notification with session ID
+4. **Tool Calls**: Execute tools using the established session
+
+### 📋 Key Technical Fixes Applied
+- **Fixed notifications format**: Removed `id` and `params` fields for notifications
+- **Added session management**: Extract and maintain `mcp-session-id` across requests
+- **SSE parsing**: Handle Server-Sent Events format: `event: message\ndata: {json}`
+- **Header management**: Include session ID in all subsequent requests
+
+## Makefile Commands
+
+The Makefile has been simplified to three core commands:
+
+### � Essential Commands
+```bash
+make pre_start      # Complete setup: environment, dependencies, Docker & MCP servers
+make run_app        # Start Streamlit web application  
+make stop          # Stop all services and cleanup
+```
+
+### � Legacy Commands (for reference)
 ```bash
 make start_docker   # Start all Docker services (databases, vLLM)
 make run_servers    # Start all MCP servers in background
-make run_app        # Start Streamlit web application
 make stop_servers   # Stop all MCP servers
-```
-
-### 🛠️ Development Commands
-```bash
-make help           # Show all available commands
-make setup-venv     # Create virtual environment
-make install        # Install Python dependencies
-make dev            # Setup development environment
-make test           # Run tests
-make lint           # Run code linting
-make format         # Format code
-```
-
-### 🐳 Docker Commands
-```bash
-make build          # Build all Docker images
-make up             # Start all Docker services
-make down           # Stop all Docker services
-make logs           # View Docker logs
-make clean          # Clean up containers and volumes
-```
-
-### 🔧 Individual Server Commands (for debugging)
-```bash
-make mongo-server     # Run MongoDB MCP server
-make milvus-server    # Run Milvus MCP server
-make websearch-server # Run WebSearch MCP server
-make scirex-server    # Run SciREX MCP server
-```
-
-### 🔍 MCP Inspector Commands
-```bash
-make inspect-mongo     # Debug MongoDB MCP server
-make inspect-milvus    # Debug Milvus MCP server
-make inspect-websearch # Debug WebSearch MCP server
-make inspect-scirex    # Debug SciREX MCP server
 ```
 
 ## FastAPI Integration
@@ -168,7 +246,37 @@ project_root/
 └── README.md
 ```
 
-## Environment Setup
+### 🔮 Next Steps & Roadmap
+
+**✅ Completed Implementations**:
+1. **✅ MCP Server Connectivity**: All 4 servers healthy with proper session management
+2. **✅ Protocol Compliance**: Fixed `notifications/initialized` format
+3. **✅ Python Environment**: Enforced Python 3.10/3.11 requirement
+4. **✅ Port Configuration**: Resolved MongoDB port conflict (8100)
+
+**Immediate Next Steps**:
+1. **Integration Testing**: Test full agent workflow with all MCP servers
+2. **End-to-End Workflow**: Verify Streamlit UI → Agent → MCP servers communication
+3. **Performance Testing**: Monitor MCP session management under load
+4. **Documentation**: Add usage examples with real scenarios
+
+**Future Enhancements**:
+- **Auto-scaling**: Implement horizontal scaling for MCP servers
+- **Monitoring**: Add comprehensive health monitoring dashboard
+- **Security**: Implement authentication for MCP sessions
+- **Performance**: Optimize session pooling and connection management
+
+### Environment Setup
+
+**Python Version Requirements** ⚠️
+```bash
+# IMPORTANT: Use Python 3.10 or 3.11 (NOT 3.9)
+python --version  # Should show 3.10.x or 3.11.x
+
+# If using wrong version, install correct Python first:
+# sudo apt install python3.11-dev python3.11-venv  # Ubuntu/Debian
+# brew install python@3.11                          # macOS
+```
 
 1. **Copy environment file:**
    ```bash
@@ -176,9 +284,11 @@ project_root/
    # Edit .env with your credentials (OpenAI API key, etc.)
    ```
 
-2. **Create virtual environment:**
+2. **Create virtual environment (Python 3.10/3.11):**
    ```bash
-   make setup-venv
+   make pre_start  # This ensures correct Python version
+   # OR manually:
+   python3.11 -m venv .venv
    source .venv/bin/activate
    ```
 

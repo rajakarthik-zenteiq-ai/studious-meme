@@ -10,12 +10,14 @@ RUN apt-get update && apt-get install -y \
     curl \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy the entire project to get config and utils
+COPY . /app
 
-# Copy server code
-COPY . .
+# Install dependencies
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+# Set Python path to include the project root
+ENV PYTHONPATH=/app:$PYTHONPATH
 
 # Create necessary directories
 RUN mkdir -p /app/data /app/logs
@@ -23,9 +25,6 @@ RUN mkdir -p /app/data /app/logs
 # Create non-root user for security
 RUN useradd -m -u 1000 mcp && chown -R mcp:mcp /app
 USER mcp
-
-# Set Python path
-ENV PYTHONPATH=/app:$PYTHONPATH
 
 # Expose port
 EXPOSE 8102
@@ -35,4 +34,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD curl -f http://localhost:8102/health || exit 1
 
 # Run server
-CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8102"]
+WORKDIR /app/mcp_servers/milvus_server
+CMD ["python", "server.py"]
