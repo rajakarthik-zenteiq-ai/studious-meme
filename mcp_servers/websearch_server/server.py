@@ -254,9 +254,66 @@ async def health_check() -> Dict[str, Any]:
             "status": search_status,
             "provider": "openai"
         },
-        "tools": ["web_search", "health_check"],
+        "tools": ["web_search", "get_current_datetime", "health_check"],
         "timestamp": datetime.utcnow().isoformat()
     }
+
+@mcp.tool()
+async def get_current_datetime() -> Dict[str, Any]:
+    """
+    Get the current date and time information.
+    
+    This tool provides comprehensive date/time information including:
+    - Current UTC time and date
+    - Local time (server timezone)
+    - Formatted timestamps in various formats
+    - Day of week, month name, etc.
+    
+    Returns:
+        Dict with current date/time information in multiple formats
+        
+    Example:
+        get_current_datetime()
+    """
+    try:
+        now_utc = datetime.utcnow()
+        now_local = datetime.now()
+        
+        return {
+            "success": True,
+            "utc": {
+                "iso_format": now_utc.isoformat() + "Z",
+                "timestamp": now_utc.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "date": now_utc.strftime("%Y-%m-%d"),
+                "time": now_utc.strftime("%H:%M:%S"),
+                "day_of_week": now_utc.strftime("%A"),
+                "month": now_utc.strftime("%B"),
+                "year": now_utc.year
+            },
+            "local": {
+                "iso_format": now_local.isoformat(),
+                "timestamp": now_local.strftime("%Y-%m-%d %H:%M:%S"),
+                "date": now_local.strftime("%Y-%m-%d"),
+                "time": now_local.strftime("%H:%M:%S"),
+                "day_of_week": now_local.strftime("%A"),
+                "month": now_local.strftime("%B"),
+                "year": now_local.year
+            },
+            "unix_timestamp": int(now_utc.timestamp()),
+            "formatted": {
+                "human_readable": now_local.strftime("%A, %B %d, %Y at %I:%M %p"),
+                "short": now_local.strftime("%m/%d/%Y %H:%M"),
+                "iso_date": now_local.strftime("%Y-%m-%d"),
+                "time_24h": now_local.strftime("%H:%M:%S"),
+                "time_12h": now_local.strftime("%I:%M:%S %p")
+            }
+        }
+    except Exception as e:
+        logger.error(f"Error getting current datetime: {e}")
+        return {
+            "success": False,
+            "error": f"Failed to get current datetime: {str(e)}"
+        }
 
 # Main entry point
 if __name__ == "__main__":

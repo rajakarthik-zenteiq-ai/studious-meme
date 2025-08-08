@@ -10,20 +10,20 @@ IS_DOCKER = os.getenv("IS_DOCKER", "false").lower() == "true"
 # ── MongoDB Server Settings ───────────────────────────────────────
 MONGO_MCP_NAME = "mongo_tools"
 MONGO_MCP_PORT = int(os.getenv("MONGO_MCP_PORT", 8100))
-MONGO_URI = os.getenv("MONGO_URI", "mongodb://admin:password@localhost:27017")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://admin:password@localhost:27018")
 MONGO_DB = os.getenv("MONGO_DB", "logsdb")
 
 # ── Redis Server Settings ─────────────────────────────────────────
 REDIS_MCP_NAME = "redis_tools"
 REDIS_MCP_PORT = int(os.getenv("REDIS_MCP_PORT", 8130))
-REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0" if IS_DOCKER else "redis://localhost:6379/0")
+REDIS_URL = os.getenv("REDIS_URL", "redis://redis:6379/0" if IS_DOCKER else "redis://localhost:6380/0")
 REDIS_CACHE_TTL = int(os.getenv("REDIS_CACHE_TTL", 3600))
 
 # ── Milvus Server Settings ────────────────────────────────────────
 MILVUS_MCP_NAME = "milvus_tools"
 MILVUS_MCP_PORT = int(os.getenv("MILVUS_MCP_PORT", 8110))
 MILVUS_HOST = os.getenv("MILVUS_HOST", "milvus" if IS_DOCKER else "localhost")
-MILVUS_PORT = int(os.getenv("MILVUS_PORT", 19530))
+MILVUS_PORT = int(os.getenv("MILVUS_PORT", 19531))
 MILVUS_COLLECTION = os.getenv("MILVUS_COLLECTION", "logs_embeddings")
 
 # ── WebSearch Server Settings ─────────────────────────────────────
@@ -90,3 +90,15 @@ MONGO_MIN_POOL_SIZE = int(os.getenv("MONGO_MIN_POOL_SIZE", 1))
 NEO4J_MAX_CONNECTION_LIFETIME = int(os.getenv("NEO4J_MAX_CONNECTION_LIFETIME", 3600))
 NEO4J_MAX_CONNECTION_POOL_SIZE = int(os.getenv("NEO4J_MAX_CONNECTION_POOL_SIZE", 50))
 REDIS_MAX_CONNECTIONS = int(os.getenv("REDIS_MAX_CONNECTIONS", 50))
+
+# ── Timeout Settings ──────────────────────────────────────────────
+# HTTP client timeouts for MCP requests (in seconds)
+MCP_CONNECT_TIMEOUT = int(os.getenv("MCP_CONNECT_TIMEOUT", 30))
+MCP_READ_TIMEOUT = int(os.getenv("MCP_READ_TIMEOUT", 300))  # 5 minutes for model training
+MCP_WRITE_TIMEOUT = int(os.getenv("MCP_WRITE_TIMEOUT", 60))
+MCP_POOL_TIMEOUT = int(os.getenv("MCP_POOL_TIMEOUT", 30))
+
+# Specific timeouts for different operations
+CLUSTERING_TIMEOUT = int(os.getenv("CLUSTERING_TIMEOUT", 600))  # 10 minutes for clustering
+MODEL_TRAINING_TIMEOUT = int(os.getenv("MODEL_TRAINING_TIMEOUT", 900))  # 15 minutes for training
+DATASET_PROCESSING_TIMEOUT = int(os.getenv("DATASET_PROCESSING_TIMEOUT", 180))  # 3 minutes for dataset ops

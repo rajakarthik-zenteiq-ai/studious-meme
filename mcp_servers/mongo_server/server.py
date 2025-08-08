@@ -26,6 +26,36 @@ from minio.error import S3Error
 # Correct FastMCP v2.x import
 from fastmcp import FastMCP, Context
 
+# Import authenticator with fallback
+try:
+    # Try to import from parent utils directory
+    sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..'))
+    from utils.oauth_auth import authenticator
+    print("Using main utils.oauth_auth authenticator")
+except ImportError:
+    try:
+        # Fallback to local oauth_auth module for Docker
+        from oauth_auth import authenticator
+        print("Using local oauth_auth authenticator")
+    except ImportError:
+        # Final fallback - create minimal authenticator
+        class MinimalAuthenticator:
+            def __init__(self):
+                self.oauth_enabled = os.getenv("OAUTH_ENABLED", "false").lower() == "true"
+            
+            def validate_request(self, request=None):
+                return {
+                    "user_id": "anonymous",
+                    "authenticated": False,
+                    "oauth_enabled": self.oauth_enabled
+                }
+            
+            def extract_user_from_context(self, context=None):
+                return self.validate_request()
+        
+        authenticator = MinimalAuthenticator()
+        print("Using minimal fallback authenticator")
+
 # ── Config ──────────────────────────────────────────────────────────
 HERE = os.path.dirname(__file__)
 PROJECT_ROOT = os.path.join(HERE, "..", "..")
@@ -1025,6 +1055,16 @@ async def upload_file(request: FileUploadRequest, ctx: Context) -> Dict[str, Any
         return {"success": False, "error": "Database not connected"}
     
     try:
+        # Extract user_id using OAuth authenticator
+        if hasattr(ctx, 'request'):
+            auth_context = authenticator.validate_request(ctx.request)
+            user_id = auth_context['user_id']
+        else:
+            # Fallback for contexts without request object
+            user_id = "anonymous"
+        
+        logger.info(f"Processing upload for user: {user_id}")
+        
         # Clean and decode base64 content
         content_str = request.content
         
@@ -1097,7 +1137,7 @@ async def upload_file(request: FileUploadRequest, ctx: Context) -> Dict[str, Any
                     file_content,
                     metadata={
                         "content_type": request.content_type,
-                        "user_id": request.user_id,
+                        "user_id": user_id,
                         "uploaded_at": datetime.utcnow(),
                         "file_size": len(file_content),
                         **request.metadata
@@ -1117,7 +1157,7 @@ async def upload_file(request: FileUploadRequest, ctx: Context) -> Dict[str, Any
             "file_id": file_id,
             "filename": request.filename,
             "content_type": request.content_type,
-            "user_id": request.user_id,
+            "user_id": user_id,
             "file_size": len(file_content),
             "uploaded_at": datetime.utcnow(),
             "storage_path": minio_path,
@@ -1564,7 +1604,8 @@ async def find_documents(
 async def list_uploaded_files(
     ctx: Context,
     file_type: Optional[str] = None,
-    limit: int = DEFAULT_QUERY_LIMIT
+    limit: int = DEFAULT_QUERY_LIMIT,
+    user_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     List uploaded files for the authenticated user with optional filtering.
@@ -1596,11 +1637,15 @@ async def list_uploaded_files(
         return {"success": False, "error": "Database not connected"}
     
     try:
-        # Extract authenticated user_id from context
-        user_id = get_user_id_from_context(ctx)
+        # Extract authenticated user_id from context, with fallback to parameter
+        context_user_id = get_user_id_from_context(ctx)
+        if context_user_id == "anonymous" and user_id:
+            final_user_id = user_id
+        else:
+            final_user_id = context_user_id
         
         # Build query with user isolation
-        query = {"user_id": user_id}  # Always filter by authenticated user
+        query = {"user_id": final_user_id}  # Always filter by authenticated user
         
         if file_type:
             query["content_type"] = {"$regex": file_type, "$options": "i"}
@@ -1624,11 +1669,11 @@ async def list_uploaded_files(
         
         return {
             "success": True,
-            "user_id": user_id,
+            "user_id": final_user_id,
             "total_files": total_count,
             "returned_count": len(files),
             "files": files,
-            "query_filters": {"user_id": user_id, "file_type": file_type}
+            "query_filters": {"user_id": final_user_id, "file_type": file_type}
         }
         
     except Exception as e:
@@ -1639,7 +1684,8 @@ async def list_uploaded_files(
 async def list_available_datasets(
     ctx: Context,
     bucket_name: str = "datasets",
-    limit: int = DEFAULT_QUERY_LIMIT
+    limit: int = DEFAULT_QUERY_LIMIT,
+    user_id: Optional[str] = None
 ) -> Dict[str, Any]:
     """
     List available datasets from MinIO storage and MongoDB collections with user isolation.
@@ -1669,8 +1715,12 @@ async def list_available_datasets(
         return {"success": False, "error": "Database not initialized"}
     
     try:
-        # Extract user_id from context headers
-        user_id = get_user_id_from_context(ctx)
+        # Extract user_id from context headers, with fallback to parameter
+        context_user_id = get_user_id_from_context(ctx)
+        if context_user_id == "anonymous" and user_id:
+            final_user_id = user_id
+        else:
+            final_user_id = context_user_id
         
         available_datasets = []
         
@@ -1681,7 +1731,7 @@ async def list_available_datasets(
                 minio_datasets = []
                 for obj in objects:
                     # Only show files that belong to the authenticated user
-                    if obj.object_name.startswith(f"{user_id}_"):
+                    if obj.object_name.startswith(f"{final_user_id}_"):
                         dataset_info = {
                             "id": obj.object_name,
                             "name": obj.object_name.split("_", 2)[-1] if "_" in obj.object_name else obj.object_name,
@@ -1690,7 +1740,7 @@ async def list_available_datasets(
                             "source": "minio",
                             "bucket": bucket_name,
                             "type": "file",
-                            "user_id": user_id
+                            "user_id": final_user_id
                         }
                         minio_datasets.append(dataset_info)
                 

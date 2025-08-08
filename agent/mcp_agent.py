@@ -6,12 +6,19 @@ import os
 import sys
 import asyncio
 import logging
+import time  # Add time import
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 from pathlib import Path
 
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+# Global cache for dataset discovery to prevent redundant calls across instances
+_dataset_cache = {}
+_cache_ttl = 60  # Increased to 60 seconds TTL to reduce HTTP calls
+_tool_call_cache = {}  # Cache for tool call results
+_tool_cache_ttl = 30  # 30 seconds for tool results
 
 from utils.auth_utils import AuthManager, UserRole
 
@@ -58,6 +65,10 @@ class MCPAgent:
         self.tools = []
         self.auth_manager = AuthManager()
         self._initialized = False
+        
+        # Enhanced: Tool call tracking for UI display
+        self.tool_calls = []
+        self.current_tool_calls = []  # Track current session tool calls
         
         # New: Smart context tracking
         self.user_context = {}
@@ -106,87 +117,117 @@ class MCPAgent:
         return accessible_servers
     
     async def _discover_user_datasets(self, user_id: str) -> List[Dict[str, Any]]:
-        """Automatically discover available datasets for the user"""
+        """Automatically discover available datasets for the user - OPTIMIZED with global caching"""
+        global _dataset_cache, _cache_ttl
+        
+        # Check global cache first
+        cache_key = f"datasets_{user_id}"
+        current_time = time.time()
+        
+        if cache_key in _dataset_cache:
+            cache_entry = _dataset_cache[cache_key]
+            if current_time - cache_entry['timestamp'] < _cache_ttl:
+                logger.info(f"Using cached datasets ({len(cache_entry['data'])} found) - global cache hit")
+                return cache_entry['data']
+        
         datasets = []
         
         try:
             if self.tools:
-                # Look for dataset listing tools
+                # Prioritize and limit tool calls to reduce HTTP overhead
+                dataset_tools = []
+                file_tools = []
+                
                 for tool in self.tools:
                     tool_name = getattr(tool, 'name', str(tool))
-                    logger.info(f"Checking tool: {tool_name}")
-                    
-                    if 'list_available_datasets' in tool_name:
-                        try:
-                            # Call the tool to get datasets
-                            result = await tool.ainvoke({"user_id": user_id})
-                            logger.info(f"Dataset tool result: {result}")
-                            if isinstance(result, dict) and result.get("success"):
-                                datasets.extend(result.get("datasets", []))
-                                logger.info(f"Found {len(result.get('datasets', []))} datasets via {tool_name}")
-                        except Exception as e:
-                            logger.warning(f"Error calling {tool_name}: {e}")
-                    
-                    elif 'list_uploaded_files' in tool_name:
-                        try:
-                            # Call the tool to get files that might be datasets
-                            # Don't use request wrapper for list tools
-                            params = {
-                                "user_id": user_id, 
-                                "file_type": "csv",
-                                "limit": 50
+                    if 'list_available_datasets' in tool_name.lower():
+                        dataset_tools.append(tool)
+                    elif 'list_uploaded_files' in tool_name.lower():
+                        file_tools.append(tool)
+                
+                # Strategy 1: Try dataset-specific tools first (most efficient)
+                for tool in dataset_tools[:1]:  # Only use the first dataset tool
+                    try:
+                        logger.info(f"Calling dataset tool: {tool.name}")
+                        result = await tool.ainvoke({"limit": 10, "user_id": user_id})
+                        
+                        if isinstance(result, dict) and result.get("success"):
+                            datasets.extend(result.get("datasets", []))
+                            logger.info(f"✅ Found {len(result.get('datasets', []))} datasets via {tool.name}")
+                            # Cache the results globally
+                            _dataset_cache[cache_key] = {
+                                'data': datasets,
+                                'timestamp': current_time
                             }
-                            logger.info(f"Calling {tool_name} with params: {params}")
-                            result = await tool.ainvoke(params)
-                            logger.info(f"List files tool result: {result}")
+                            return datasets  # Early return to avoid redundant calls
+                        
+                    except Exception as e:
+                        logger.warning(f"Dataset tool {tool.name} failed: {e}")
+                
+                # Strategy 2: Only use file tools if no datasets found and limit calls
+                if not datasets and file_tools:
+                    tool = file_tools[0]  # Use only the first available file tool
+                    try:
+                        # Minimal parameters to reduce processing time
+                        params = {
+                            "file_type": "csv",  # Focus on data files
+                            "limit": 5,  # Strict limit to reduce processing
+                            "user_id": user_id
+                        }
+                        
+                        logger.info(f"Calling file tool: {tool.name} (limited to 5 files)")
+                        result = await tool.ainvoke(params)
+                        
+                        if isinstance(result, dict) and result.get("success"):
+                            files = result.get("files", [])
+                            logger.info(f"✅ Retrieved {len(files)} files via {tool.name}")
                             
-                            # Fix: Properly handle successful responses with or without files
-                            if isinstance(result, dict) and result.get("success") == True:
-                                files = result.get("files", [])
-                                returned_count = result.get("returned_count", len(files))
-                                total_files = result.get("total_files", 0)
+                            # Convert files to dataset format
+                            for file_info in files:
+                                dataset_info = {
+                                    "id": file_info.get("file_id", file_info.get("_id")),
+                                    "name": file_info.get("filename", "unnamed"),
+                                    "size": file_info.get("file_size", 0),
+                                    "source": "uploaded_files",
+                                    "type": "file",
+                                    "uploaded_at": file_info.get("uploaded_at"),
+                                    "content_type": file_info.get("content_type", "unknown")
+                                }
+                                datasets.append(dataset_info)
                                 
-                                logger.info(f"Successfully retrieved file list: {len(files)} files (returned: {returned_count}, total: {total_files})")
-                                
-                                if len(files) == 0:
-                                    logger.info(f"No CSV files found for user {user_id} - this is normal if no files have been uploaded")
-                                else:
-                                    for file_info in files:
-                                        logger.debug(f"Processing file: {file_info}")
-                                        dataset_info = {
-                                            "id": file_info.get("file_id", file_info.get("_id")),
-                                            "name": file_info.get("filename", "unnamed"),
-                                            "size": file_info.get("file_size", 0),
-                                            "source": "uploaded_files",
-                                            "type": "file",
-                                            "uploaded_at": file_info.get("uploaded_at"),
-                                            "content_type": file_info.get("content_type")
-                                        }
-                                        datasets.append(dataset_info)
-                                    logger.info(f"Found {len(files)} uploaded files via {tool_name}")
-                            else:
-                                # Only warn on actual API errors, not on empty results
-                                if isinstance(result, dict) and result.get("success") == False:
-                                    logger.warning(f"Tool {tool_name} returned error: {result.get('error', 'Unknown error')}")
-                                else:
-                                    logger.warning(f"Tool {tool_name} returned unexpected result format: {result}")
-                        except Exception as e:
-                            logger.warning(f"Error calling {tool_name}: {e}")
-                            import traceback
-                            logger.warning(f"Traceback: {traceback.format_exc()}")
+                    except Exception as e:
+                        logger.warning(f"File tool {tool.name} failed: {e}")
         
         except Exception as e:
-            logger.error(f"Error discovering datasets: {e}")
-            import traceback
-            logger.error(f"Traceback: {traceback.format_exc()}")
+            logger.error(f"Error in dataset discovery: {e}")
         
-        logger.info(f"Discovered {len(datasets)} total datasets for user {user_id}")
+        # Cache results globally even if empty to avoid repeated failures
+        _dataset_cache[cache_key] = {
+            'data': datasets,
+            'timestamp': current_time
+        }
+        
+        logger.info(f"📊 Dataset discovery completed: {len(datasets)} total datasets")
         return datasets
 
     async def refresh_datasets(self, user_id: str) -> int:
         """Manually refresh the available datasets"""
         self.available_datasets = await self._discover_user_datasets(user_id)
         logger.info(f"Refreshed datasets: {len(self.available_datasets)}")
+        return len(self.available_datasets)
+
+    def invalidate_dataset_cache(self, user_id: str):
+        """Invalidate dataset cache for a specific user to force refresh"""
+        cache_key = f"datasets_{user_id}"
+        if cache_key in _dataset_cache:
+            del _dataset_cache[cache_key]
+            logger.info(f"Invalidated dataset cache for user: {user_id}")
+
+    async def refresh_datasets_after_upload(self, user_id: str) -> int:
+        """Refresh datasets after file upload by invalidating cache"""
+        self.invalidate_dataset_cache(user_id)
+        self.available_datasets = await self._discover_user_datasets(user_id)
+        logger.info(f"Refreshed datasets after upload: {len(self.available_datasets)}")
         return len(self.available_datasets)
 
     async def initialize(self, user_role: UserRole = UserRole.VIEWER, user_id: str = "system"):
@@ -301,14 +342,29 @@ Please upload your data or ask questions about data analysis."""
 {resource_context}
 
 Your goal is to help users analyze their data by:
-1. Automatically detecting uploaded datasets
-2. Performing clustering and classification analysis  
+1. Automatically detecting uploaded datasets using list_uploaded_files and list_available_datasets tools
+2. Performing clustering and classification analysis using proper file IDs  
 3. Providing actionable business insights
 4. Using appropriate tools to complete analysis tasks
 
-When users upload datasets, automatically analyze them without asking for file IDs.
-For clustering requests, use available datasets intelligently.
-Provide specific insights based on the actual data uploaded.
+CRITICAL WORKFLOW FOR DATA ANALYSIS:
+
+For File Upload:
+- Use upload_file tool with exact parameters: filename, content (base64), content_type
+- ALWAYS extract and save the file_id from the upload response
+- Confirm successful upload before proceeding
+
+For Clustering Analysis:
+- First call list_uploaded_files to get available CSV files with their file IDs
+- Use the file_id (not filename) as dataset_id in cluster_analysis tool
+- Example: cluster_analysis with dataset_id as the actual file_id, user_id as user, n_clusters as 3
+
+For Dataset Discovery:
+- Use list_uploaded_files to find user's uploaded CSV/data files
+- Use list_available_datasets to find datasets in storage buckets
+- Each file has a unique file_id that must be used for downstream analysis
+
+NEVER use filename as dataset_id - always use the actual file_id returned from upload or listing tools.
 
 Use the available tools effectively to provide comprehensive data analysis."""
             
@@ -365,11 +421,14 @@ Use the available tools effectively to provide comprehensive data analysis."""
         user_role: UserRole = UserRole.VIEWER,
         attachments: Optional[List[Any]] = None
     ) -> str:
-        """Analyze a query using the agent with smart context handling"""
+        """Analyze a query using the agent with smart context handling and tool tracking"""
         if not self._initialized or self.user_context.get("user_id") != user_id:
             await self.initialize(user_role, user_id)
 
         try:
+            # Clear previous tool calls for this query
+            self.clear_current_tool_calls()
+            
             # Enhance query with context if needed
             enhanced_query = self._enhance_query_with_context(query, user_id)
             
@@ -389,7 +448,9 @@ Use the available tools effectively to provide comprehensive data analysis."""
                 "configurable": {"thread_id": f"{user_id}:{conversation_id}"},
                 "recursion_limit": 50  # Increase recursion limit for complex operations
             }
-            result = await self.graph.ainvoke(initial_state, config=config)
+            
+            # Execute with tool call monitoring
+            result = await self._execute_with_tool_tracking(initial_state, config)
             
             # Extract response
             last_message = result["messages"][-1]
@@ -408,6 +469,62 @@ Use the available tools effectively to provide comprehensive data analysis."""
         except Exception as e:
             logger.error(f"Error during analysis: {str(e)}")
             return self._generate_helpful_fallback_response(query, str(e))
+    
+    async def _execute_with_tool_tracking(self, initial_state, config):
+        """Execute agent graph with enhanced tool call tracking"""
+        try:
+            # Clear current tool calls for this execution
+            self.clear_current_tool_calls()
+            
+            # Execute the graph
+            result = await self.graph.ainvoke(initial_state, config=config)
+            
+            # Process tool calls from messages with improved tracking
+            tool_call_count = 0
+            if "messages" in result:
+                for msg in result["messages"]:
+                    # Track tool call messages
+                    if hasattr(msg, 'tool_calls') and msg.tool_calls:
+                        for tool_call in msg.tool_calls:
+                            tool_name = tool_call.get('name', 'unknown')
+                            tool_args = tool_call.get('args', {})
+                            tool_id = tool_call.get('id', 'unknown')
+                            
+                            # Track tool call with input
+                            self._track_tool_call(tool_name, tool_args)
+                            tool_call_count += 1
+                            
+                            logger.info(f"🔧 Tool call detected: {tool_name} with args: {list(tool_args.keys())}")
+                    
+                    # Track tool response messages
+                    if hasattr(msg, 'content') and hasattr(msg, 'tool_call_id'):
+                        # This is a tool response message - find the corresponding call and update result
+                        tool_call_id = msg.tool_call_id
+                        content = str(msg.content)
+                        
+                        # Update the most recent call with this result
+                        if self.current_tool_calls:
+                            for call in reversed(self.current_tool_calls):
+                                if call.get('id') == tool_call_id or not call.get('result'):
+                                    call['result'] = content[:200]  # Limit result size
+                                    call['full_result'] = content
+                                    
+                                    # Check for errors in the response
+                                    if any(error_word in content.lower() for error_word in ['error', 'failed', 'exception']):
+                                        call['status'] = 'error'
+                                        call['error'] = content[:100]
+                                    
+                                    logger.info(f"🔧 Tool response detected: content='{content[:100]}...'")
+                                    break
+            
+            logger.info(f"✅ Execution completed with {tool_call_count} tool calls tracked")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Tool tracking execution failed: {str(e)}")
+            # Track the error
+            self._track_tool_call("execution_error", {"error": str(e)}, error=str(e))
+            raise
     
     def _enhance_query_with_context(self, query: str, user_id: str) -> str:
         """Enhance user query with available context"""
@@ -485,6 +602,73 @@ Use the available tools effectively to provide comprehensive data analysis."""
             logger.error(f"Startup validation failed: {e}")
         
         return validation_results
+
+    def _track_tool_call(self, tool_name: str, args: Dict[str, Any], result: Any = None, error: str = None):
+        """Track tool calls for UI display with improved detail"""
+        call_info = {
+            "name": tool_name,
+            "args": args,
+            "timestamp": datetime.now().isoformat(),
+            "status": "error" if error else "success",
+            "result": str(result)[:500] if result else None,
+            "full_result": str(result) if result else None,
+            "error": error,
+            "id": f"{tool_name}_{len(self.tool_calls)}"
+        }
+        
+        self.tool_calls.append(call_info)
+        self.current_tool_calls.append(call_info)
+        
+        # Log tool call details
+        status_icon = "❌" if error else "✅"
+        logger.info(f"🔧 Tool tracked: {status_icon} {tool_name} - {call_info['status']}")
+        
+        if error:
+            logger.error(f"Tool error details: {error}")
+        if result:
+            result_preview = str(result)[:100] + "..." if len(str(result)) > 100 else str(result)
+            logger.info(f"Tool response detected: content='{result_preview}'")
+        
+    def get_current_tool_calls(self) -> List[Dict[str, Any]]:
+        """Get tool calls from current session"""
+        return self.current_tool_calls.copy()
+        
+    def clear_current_tool_calls(self):
+        """Clear current session tool calls"""
+        self.current_tool_calls = []
+    
+    async def get_agent_status(self) -> Dict[str, Any]:
+        """Get comprehensive agent status for monitoring"""
+        status = {
+            "initialized": self._initialized,
+            "mcp_client_active": self.mcp_client is not None,
+            "tools_count": len(self.tools),
+            "user_role": self.user_role.value if hasattr(self, 'user_role') else None,
+            "graph_created": self.graph is not None,
+            "llm_provider": self.llm_provider,
+            "memory_manager_active": self.memory_manager is not None,
+            "datasets_count": len(self.available_datasets),
+            "tool_calls_count": len(self.tool_calls)
+        }
+        
+        # Add tool details if available
+        if self.tools:
+            status["tool_names"] = [getattr(tool, 'name', str(tool)) for tool in self.tools]
+        else:
+            status["tool_names"] = []
+        
+        # Add dataset info
+        if self.available_datasets:
+            status["datasets"] = [
+                {
+                    "name": dataset.get('name', 'unnamed'),
+                    "id": dataset.get('id', 'unknown'),
+                    "source": dataset.get('source', 'unknown')
+                }
+                for dataset in self.available_datasets[:5]
+            ]
+        
+        return status
 
 # Factory function
 def create_agent():

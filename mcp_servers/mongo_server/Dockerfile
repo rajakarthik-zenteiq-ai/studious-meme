@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r /app/requirements.txt
 # Copy server files
 COPY mcp_servers/mongo_server/server.py /app/
 COPY mcp_servers/mongo_server/__init__.py /app/
+COPY mcp_servers/mongo_server/oauth_auth.py /app/
 
 # Copy config directory
 COPY config /app/config/

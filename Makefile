@@ -1,7 +1,7 @@
 # MCP Server Management Makefile
 # Simplified version with only essential commands
 
-.PHONY: pre_start run_app test test_targeted test_summary stop help
+.PHONY: pre_start run_app test test_unit test_integration health_check stop help
 
 # Colors for terminal output
 RED=\033[0;31m
@@ -44,26 +44,31 @@ pre_start: ## Initialize environment, install dependencies, start Docker service
 	sleep 10
 	@echo "$(GREEN)✅ Environment setup complete!$(NC)"
 	@echo "$(BLUE)🧪 Testing MCP connectivity...$(NC)"
-	.venv/bin/python mcp_test.py
+	.venv/bin/python connectivity_test.py --startup
 
 run_app: ## Run the main MCP application
 	@echo "$(YELLOW)🏃 Running MCP application...$(NC)"
 	@echo "$(BLUE)📱 Starting Streamlit UI...$(NC)"
 	.venv/bin/python -m streamlit run ui_streamlit.py --server.port 8501 --server.address 0.0.0.0
 
-test: ## Run comprehensive MCP test suite (upload + clustering workflow)
-	@echo "$(YELLOW)🧪 Running comprehensive MCP test suite...$(NC)"
-	@echo "$(BLUE)📋 Testing upload and clustering workflow...$(NC)"
-	.venv/bin/python mcp_test.py
+test: ## Run MCP connectivity tests
+	@echo "$(YELLOW)🧪 Running MCP connectivity tests...$(NC)"
+	@echo "$(BLUE)� Testing MCP server connections...$(NC)"
+	.venv/bin/python connectivity_test.py
 
-test_targeted: ## Run targeted test with direct data upload and clustering
-	@echo "$(YELLOW)🎯 Running targeted MCP test with direct data...$(NC)"
-	@echo "$(BLUE)📊 Testing complete upload and clustering workflow...$(NC)"
-	.venv/bin/python targeted_test.py
+test_unit: ## Run unit tests
+	@echo "$(YELLOW)🧪 Running unit tests...$(NC)"
+	@echo "$(BLUE)🔧 Testing individual components...$(NC)"
+	.venv/bin/python -m pytest tests/test_unit.py -v
 
-test_summary: ## Show summary of successful test results
-	@echo "$(BLUE)📋 Displaying test results summary...$(NC)"
-	python3 test_summary.py
+test_integration: ## Run integration tests
+	@echo "$(YELLOW)🔗 Running integration tests...$(NC)"
+	@echo "$(BLUE)📊 Testing end-to-end workflows...$(NC)"
+	.venv/bin/python -m pytest tests/test_integration.py -v
+
+health_check: ## Run health check tests
+	@echo "$(BLUE)🏥 Running health checks...$(NC)"
+	.venv/bin/python tests/health_check.py
 
 stop: ## Stop all services (MCP servers and Docker containers)
 	@echo "$(YELLOW)🛑 Stopping all MCP services...$(NC)"

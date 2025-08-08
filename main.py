@@ -1,17 +1,21 @@
 #!/usr/bin/env python3
 """
-Main entrypoint for the MCP-based Log Analysis System.
+Production entrypoint for the MCP-based Log Analysis System.
 """
 import asyncio
 import argparse
 import sys
+import logging
 from pathlib import Path
 
 # Add the project root to the Python path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from mcp_client.main import main as client_main
-from agent.agent import create_agent
+from agent.mcp_agent import MCPAgent
+
+# Production logging
+logging.basicConfig(level=logging.WARNING)
 
 
 def create_fastapi_app():
@@ -121,9 +125,9 @@ def main():
             ))
             print(result)
         else:
-            print("Please provide a --query for agent mode")
+            logging.error("Please provide a --query for agent mode")
     elif args.mode == "api":
-        print(f"Starting FastAPI server on {args.host}:{args.port}")
+        logging.info(f"Starting FastAPI server on {args.host}:{args.port}")
         run_fastapi_server(host=args.host, port=args.port)
     else:
         parser.print_help()
