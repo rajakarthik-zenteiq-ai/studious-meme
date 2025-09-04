@@ -55,29 +55,16 @@ class InsertVectors(BaseModel):
 
 # Tool definitions
 @mcp.tool()
-async def search_similar(query: VectorQuery) -> Dict[str, Any]:
+async def vector_search(request: VectorQuery) -> Dict[str, Any]:
     """
-    Search for similar vectors in Milvus collection using semantic similarity.
-    
-    This tool performs high-performance vector similarity search using Milvus:
-    - Supports multiple distance metrics (L2, IP, COSINE)
-    - Configurable search parameters and result limits
-    - Returns similarity scores and associated metadata
-    - Automatic collection loading and optimization
+    Semantic vector search in a Milvus collection.
     
     Args:
-        query: VectorQuery object with query_vector, collection_name, top_k, and search_params
-        
-    Returns:
-        Structured response with similar vectors, distances, and metadata
-        
-    Example:
-        search_similar({
-            "query_vector": [0.1, 0.2, ...],
-            "collection_name": "documents", 
-            "top_k": 10,
-            "search_params": {"metric_type": "L2"}
-        })
+    - request.query_vector: List[float] embedding to search with
+    - request.limit: How many results to return (1-100)
+    - request.collection_name: Milvus collection to search
+    
+    Returns a list of nearest vectors with distances and basic metadata.
     """
     if not milvus_connected:
         return {
@@ -87,21 +74,21 @@ async def search_similar(query: VectorQuery) -> Dict[str, Any]:
     
     try:
         # Check if collection exists
-        if not utility.has_collection(query.collection_name):
+        if not utility.has_collection(request.collection_name):
             return {
                 "success": False,
-                "error": f"Collection {query.collection_name} does not exist"
+                "error": f"Collection {request.collection_name} does not exist"
             }
         
-        collection = Collection(query.collection_name)
+        collection = Collection(request.collection_name)
         collection.load()
         
         # Perform search
         search_results = collection.search(
-            data=[query.query_vector],
+            data=[request.query_vector],
             anns_field="vector",
             param={"metric_type": "L2", "params": {"nprobe": 10}},
-            limit=query.limit,
+            limit=request.limit,
             output_fields=["id"]
         )
 
@@ -116,7 +103,7 @@ async def search_similar(query: VectorQuery) -> Dict[str, Any]:
         
         return {
             "success": True,
-            "collection": query.collection_name,
+            "collection": request.collection_name,
             "count": len(results),
             "results": results
         }
@@ -128,8 +115,8 @@ async def search_similar(query: VectorQuery) -> Dict[str, Any]:
         }
 
 @mcp.tool()
-async def insert_vectors(request: InsertVectors) -> Dict[str, Any]:
-    """Insert vectors into Milvus collection."""
+async def vector_insert(request: InsertVectors) -> Dict[str, Any]:
+    """Insert vectors with optional metadata into a Milvus collection."""
     if not milvus_connected:
         return {
             "success": False,
@@ -170,8 +157,8 @@ async def insert_vectors(request: InsertVectors) -> Dict[str, Any]:
         }
 
 @mcp.tool()
-async def get_collection_stats() -> Dict[str, Any]:
-    """Get statistics for all collections."""
+async def milvus_stats() -> Dict[str, Any]:
+    """Get statistics for all Milvus collections (count, description)."""
     if not milvus_connected:
         return {
             "success": False,
@@ -221,7 +208,7 @@ async def health_check() -> Dict[str, Any]:
         "host": MILVUS_HOST,
         "port": MILVUS_PORT,
         "collection_count": collection_count,
-        "tools": ["search_similar", "insert_vectors", "get_collection_stats", "health_check"],
+        "tools": ["vector_search", "vector_insert", "milvus_stats", "health_check"],
         "timestamp": datetime.utcnow().isoformat()
     }
 

@@ -1,7 +1,7 @@
 # MCP Server Management Makefile
 # Simplified version with only essential commands
 
-.PHONY: pre_start run_app test test_unit test_integration health_check stop help
+.PHONY: pre_start run_app run_app_alt test test_unit test_integration health_check stop help
 
 # Colors for terminal output
 RED=\033[0;31m
@@ -49,7 +49,15 @@ pre_start: ## Initialize environment, install dependencies, start Docker service
 run_app: ## Run the main MCP application
 	@echo "$(YELLOW)🏃 Running MCP application...$(NC)"
 	@echo "$(BLUE)📱 Starting Streamlit UI...$(NC)"
+	@echo "$(GREEN)🌐 Access the app at: http://localhost:8501$(NC)"
 	.venv/bin/python -m streamlit run ui_streamlit.py --server.port 8501 --server.address 0.0.0.0
+
+run_app_alt: ## Run the MCP application on alternative port 8506
+	@echo "$(YELLOW)🏃 Running MCP application on port 8506...$(NC)"
+	@echo "$(BLUE)📱 Starting Streamlit UI...$(NC)"
+	@echo "$(GREEN)🌐 Access the app at: http://localhost:8506$(NC)"
+	@echo "$(YELLOW)⚠️  Alternative URL: http://127.0.0.1:8506$(NC)"
+	.venv/bin/python -m streamlit run ui_streamlit.py --server.port 8506 --server.address 0.0.0.0
 
 test: ## Run MCP connectivity tests
 	@echo "$(YELLOW)🧪 Running MCP connectivity tests...$(NC)"

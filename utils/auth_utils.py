@@ -22,6 +22,7 @@ class UserRole(str, Enum):
     DEVELOPER = "developer"
     ANALYST = "analyst"
     VIEWER = "viewer"
+    USER = "user"  # Backward compatibility for legacy tests
 
 class AccessLevel(str, Enum):
     """Access level definitions"""
@@ -340,6 +341,45 @@ class AuthManager:
             },
             "accessible_tools": self.get_accessible_tools(user_role)
         }
+    
+    def check_permission(self, user_role: UserRole, permission_name: str) -> bool:
+        """Compatibility helper used by tests.
+        Supports simple permission strings like 'file_upload' by mapping to tool access levels.
+        Returns True if user has sufficient access for the implied action.
+        """
+        # Map legacy/simple permission names to tool names and required actions
+        perm = (permission_name or '').lower().strip()
+        alias_map = {
+            'file_upload': ('upload_file', 'write'),
+            'file_download': ('download_file', 'read'),
+            'logs_read': ('get_logs_by_date', 'read'),
+            'logs_write': ('store_logs', 'write'),
+            'cluster_execute': ('perform_clustering', 'execute'),
+        }
+        if perm not in alias_map:
+            # Fallback: if direct tool exists, default to read
+            tool_name = perm
+            required_action = 'read'
+        else:
+            tool_name, required_action = alias_map[perm]
+        # Determine which server this tool likely belongs to (heuristic similar to get_accessible_tools)
+        server_candidates = []
+        if any(k in tool_name for k in ['log', 'chat', 'file']):
+            server_candidates.append('mongodb')
+        if any(k in tool_name for k in ['vector', 'collection', 'milvus']):
+            server_candidates.append('milvus')
+        if 'search' in tool_name:
+            server_candidates.append('websearch')
+        if any(k in tool_name for k in ['train', 'predict', 'cluster']):
+            server_candidates.append('scirex')
+        if not server_candidates:
+            # If unknown, try all servers user can access
+            server_candidates = [s for s, v in self.role_permissions.get(user_role, {}).get('servers', {}).items() if v != AccessLevel.NONE]
+        # Allow if any candidate server grants permission
+        for server in server_candidates:
+            if self.check_tool_permission(user_role, server, tool_name, required_action):
+                return True
+        return False
 
 # Global auth manager instance
 auth_manager = AuthManager()

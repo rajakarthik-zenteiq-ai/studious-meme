@@ -29,14 +29,19 @@ class MCPClient:
     def __init__(self, provider: str = "openai", model: str = "gpt-4o-mini"):
         self.provider = provider
         self.model = model
-        self.agent = MCPAgent(llm_provider=provider)
+        self.agent = MCPAgent()
         self.auth_manager = AuthManager()
         self.current_role: Optional[UserRole] = None
     
     async def initialize(self, user_role: UserRole = UserRole.VIEWER):
         """Initialize agent with user role"""
         self.current_role = user_role
-        await self.agent.initialize(user_role)
+        
+        # Create UserContext for the agent
+        from agent.rbac_system import get_rbac_manager
+        rbac = get_rbac_manager()
+        user_context = rbac.create_user_context(f"client_{id(self)}", user_role)
+        await self.agent.initialize(user_context)
         
         # Filter accessible servers based on role
         accessible_servers = self._get_accessible_servers(user_role)
@@ -147,52 +152,43 @@ class MCPClient:
         
         # Check if query involves restricted tools
         try:
-            # The agent will handle tool access through RBAC
-            result = await self.agent.analyze(
+            # Use the agent chat API (LLM+LangGraph planner)
+            result = await self.agent.chat(
                 query=query,
                 user_id=user_id,
-                conversation_id=conversation_id
+                conversation_id=conversation_id,
+                user_role=user_role,
             )
-            
             # Enhanced error handling for common issues
-            if "not found" in result.lower() and ("file" in query.lower() or "dataset" in query.lower()):
-                # Provide helpful suggestions for file/dataset not found errors
+            if isinstance(result, str) and "not found" in result.lower() and ("file" in query.lower() or "dataset" in query.lower()):
                 enhanced_result = result + "\n\n💡 **Troubleshooting suggestions:**\n"
                 enhanced_result += "1. Check if the file exists in the database using: `check the db for dataset`\n"
                 enhanced_result += "2. Verify the file ID is correct (use `list_uploaded_files` tool)\n"
                 enhanced_result += "3. Ensure you have permission to access this file\n"
                 enhanced_result += "4. Try uploading the dataset again if it's missing\n"
-                enhanced_result += "5. Check if the file is stored in MinIO or GridFS storage\n"
+                enhanced_result += "5. Check if the file is stored in S3 or GridFS storage\n"
                 return enhanced_result
-            
-            # Handle clustering-specific errors
-            if "clustering" in query.lower() and ("error" in result.lower() or "failed" in result.lower()):
-                enhanced_result = result + "\n\n🔧 **For clustering analysis:**\n"
-                enhanced_result += "1. Ensure the dataset is properly formatted (CSV with numeric columns)\n"
-                enhanced_result += "2. Check that the file was uploaded successfully\n"
-                enhanced_result += "3. Verify the dataset contains the expected columns for clustering\n"
-                enhanced_result += "4. Try using a local file if the database version has issues\n"
-                return enhanced_result
-                
+            if isinstance(result, str) and "clustering" in query.lower() and ("error" in result.lower() or "failed" in result.lower()):
+                enhanced = result + "\n\n🔧 **For clustering analysis:**\n"
+                enhanced += "1. Ensure the dataset is properly formatted (CSV with numeric columns)\n"
+                enhanced += "2. Check that the file was uploaded successfully\n"
+                enhanced += "3. Verify the dataset contains the expected columns for clustering\n"
+                enhanced += "4. Try using a local file if the database version has issues\n"
+                return enhanced
             return result
-            
         except Exception as e:
             if "permission denied" in str(e).lower():
                 return f"❌ Access denied: {e}"
-            
-            # Enhanced error reporting
             error_msg = f"❌ An error occurred while processing your request: {str(e)}\n\n"
             error_msg += "🔍 **Diagnostic information:**\n"
             error_msg += f"- User role: {user_role.value}\n"
             error_msg += f"- Query type: {'Dataset/File operation' if any(keyword in query.lower() for keyword in ['file', 'dataset', 'download', 'upload']) else 'General query'}\n"
             error_msg += f"- Available servers: {list(self._get_accessible_servers(user_role).keys())}\n"
-            
             if "file" in query.lower() or "dataset" in query.lower():
                 error_msg += "\n💭 **Suggested actions:**\n"
                 error_msg += "1. Try checking what files are available in the database\n"
                 error_msg += "2. Verify the file ID or filename is correct\n"
                 error_msg += "3. Check if you have the right permissions for this operation\n"
-            
             return error_msg
     
     async def check_tool_access(
@@ -362,51 +358,50 @@ class MCPClient:
                 return diagnosis
             
             # Try to get file metadata first
-            metadata_query = f"Find file metadata for file_id: {file_id}"
-            metadata_result = await self.agent.analyze(
-                query=metadata_query,
+            metadata_result = await self.agent.chat(
+                query=f"Find file metadata for file_id: {file_id}",
                 user_id="diagnostic",
-                conversation_id="diagnostic"
+                conversation_id="diagnostic",
+                user_role=user_role,
             )
             
-            if "not found" in metadata_result.lower():
+            if isinstance(metadata_result, str) and "not found" in metadata_result.lower():
                 diagnosis["issues_found"].append("File metadata not found in database")
                 diagnosis["suggestions"].extend([
                     "Check if the file ID is correct",
                     "List all uploaded files to verify the file exists",
-                    "Try re-uploading the file if it's missing"
+                    "Try re-uploading the file if it's missing",
                 ])
             else:
                 diagnosis["metadata_found"] = True
                 
                 # Try to download the file
-                download_query = f"Download file with ID: {file_id}"
-                download_result = await self.agent.analyze(
-                    query=download_query,
-                    user_id="diagnostic", 
-                    conversation_id="diagnostic"
+                download_result = await self.agent.chat(
+                    query=f"Download file with ID: {file_id}",
+                    user_id="diagnostic",
+                    conversation_id="diagnostic",
+                    user_role=user_role,
                 )
                 
-                if "error" in download_result.lower() or "failed" in download_result.lower():
+                if isinstance(download_result, str) and ("error" in download_result.lower() or "failed" in download_result.lower()):
                     diagnosis["issues_found"].append("File download failed")
                     if "access denied" in download_result.lower():
                         diagnosis["suggestions"].append("You may not have permission to download this file")
-                    elif "minio" in download_result.lower():
+                    elif "s3" in download_result.lower():
                         diagnosis["suggestions"].extend([
-                            "File storage backend (MinIO) may be unavailable",
-                            "Check if MinIO service is running",
-                            "Try using GridFS fallback if available"
+                            "File storage backend (S3) may be unavailable",
+                            "Check if S3 service is running",
+                            "Try using GridFS fallback if available",
                         ])
                     else:
                         diagnosis["suggestions"].extend([
                             "File may be corrupted in storage",
                             "Try re-uploading the file",
-                            "Check server logs for detailed error information"
+                            "Check server logs for detailed error information",
                         ])
                 else:
                     diagnosis["download_successful"] = True
                     diagnosis["suggestions"].append("File download should work normally")
-        
         except Exception as e:
             diagnosis["issues_found"].append(f"Diagnostic error: {str(e)}")
             diagnosis["suggestions"].append("Contact system administrator for assistance")
@@ -490,13 +485,14 @@ class MCPClient:
         # Check file listing capability
         troubleshoot_report += "\n**2. File Listing Check:**\n"
         try:
-            list_result = await self.agent.analyze(
+            list_result = await self.agent.chat(
                 query="List all uploaded files in the database",
                 user_id="troubleshoot",
-                conversation_id="troubleshoot"
+                conversation_id="troubleshoot",
+                user_role=user_role,
             )
             
-            if "error" in list_result.lower():
+            if isinstance(list_result, str) and "error" in list_result.lower():
                 troubleshoot_report += "❌ Cannot list files in database\n"
                 troubleshoot_report += f"   Error: {list_result[:100]}...\n"
             else:
@@ -515,13 +511,14 @@ class MCPClient:
             
             # Check file metadata
             try:
-                metadata_result = await self.agent.analyze(
+                metadata_result = await self.agent.chat(
                     query=f"Get metadata for file with ID: {file_id}",
                     user_id="troubleshoot",
-                    conversation_id="troubleshoot"
+                    conversation_id="troubleshoot",
+                    user_role=user_role,
                 )
                 
-                if "not found" in metadata_result.lower():
+                if isinstance(metadata_result, str) and "not found" in metadata_result.lower():
                     troubleshoot_report += "❌ File metadata not found\n"
                     troubleshoot_report += "   → **Action:** Verify file ID is correct\n"
                     troubleshoot_report += "   → **Action:** Check if file was uploaded successfully\n"
@@ -529,19 +526,20 @@ class MCPClient:
                     troubleshoot_report += "✅ File metadata exists\n"
                     
                     # Try download
-                    download_result = await self.agent.analyze(
+                    download_result = await self.agent.chat(
                         query=f"Download file with ID: {file_id}",
                         user_id="troubleshoot",
-                        conversation_id="troubleshoot"
+                        conversation_id="troubleshoot",
+                        user_role=user_role,
                     )
                     
-                    if "error" in download_result.lower() or "failed" in download_result.lower():
+                    if isinstance(download_result, str) and ("error" in download_result.lower() or "failed" in download_result.lower()):
                         troubleshoot_report += "❌ File download failed\n"
                         troubleshoot_report += f"   Error details: {download_result[:200]}...\n"
                         
-                        if "minio" in download_result.lower():
-                            troubleshoot_report += "   → **Issue:** MinIO storage backend problem\n"
-                            troubleshoot_report += "   → **Action:** Check MinIO service status\n"
+                        if "s3" in download_result.lower():
+                            troubleshoot_report += "   → **Issue:** S3 storage backend problem\n"
+                            troubleshoot_report += "   → **Action:** Check S3 service status\n"
                         elif "access denied" in download_result.lower():
                             troubleshoot_report += "   → **Issue:** Permission problem\n"
                             troubleshoot_report += "   → **Action:** Check file ownership\n"
@@ -582,26 +580,16 @@ class MCPClient:
     ) -> str:
         """Handle clustering requests with built-in error recovery"""
         await self.initialize(user_role)
-        
-        # First try the normal clustering approach
-        if file_id:
-            query = f"Perform clustering analysis on dataset with file ID: {file_id}"
-        else:
-            query = "Perform clustering on the available dataset in the database"
-        
+        query = f"Perform clustering analysis on dataset with file ID: {file_id}" if file_id else "Perform clustering on the available dataset in the database"
         try:
-            result = await self.agent.analyze(
+            result = await self.agent.chat(
                 query=query,
                 user_id="clustering_user",
-                conversation_id="clustering_session"
+                conversation_id="clustering_session",
+                user_role=user_role,
             )
-            
-            # Check if clustering was successful
-            if ("error" not in result.lower() and 
-                "failed" not in result.lower() and 
-                "not found" not in result.lower()):
+            if isinstance(result, str) and ("error" not in result.lower() and "failed" not in result.lower() and "not found" not in result.lower()):
                 return result
-            
             # If there's an error, provide enhanced troubleshooting
             error_response = "❌ **Clustering failed with database file**\n\n"
             error_response += f"Original error: {result[:200]}...\n\n"
@@ -661,6 +649,44 @@ class MCPClient:
             error_msg += "2. Verify your role permissions\n"
             error_msg += "3. Try with a local file as fallback\n"
             return error_msg
+    
+    async def call_tool(self, tool_name: str, args: Dict[str, Any], user_role: UserRole = UserRole.VIEWER) -> Any:
+        """Direct tool invocation bypassing LLM planning."""
+        await self.initialize(user_role)
+        raw = await self.agent.invoke_tool(tool_name, args, user_role=user_role)
+        # Normalize possible JSON-string results from adapters into dicts
+        if isinstance(raw, str):
+            try:
+                import json as _json
+                parsed = _json.loads(raw)
+                return parsed
+            except Exception:
+                return {"success": True, "result": raw}
+        return raw
+    
+    async def chat(self, message: str, user_id: str = "test_user", conversation_id: Optional[str] = None, user_role: Optional[UserRole] = None) -> Dict[str, Any]:
+        """Simple chat wrapper used by tests; ensures initialization and returns a dict with 'response'."""
+        try:
+            role = user_role or self.current_role or UserRole.VIEWER
+            if self.current_role is None:
+                await self.initialize(role)
+            
+            # Create UserContext for the agent
+            from agent.rbac_system import get_rbac_manager
+            rbac = get_rbac_manager()
+            user_context = rbac.create_user_context(user_id, role)
+            
+            result = await self.agent.process_message(
+                message=message,
+                conversation_id=conversation_id or "test-conv",
+                user_context=user_context,
+            )
+            if isinstance(result, dict):
+                return {"response": result.get("result", result), **({} if "response" in result else {})}
+            return {"response": result}
+        except Exception as e:
+            return {"response": f"Error: {e}"}
+
 # Utility functions
 async def create_mcp_client(
     provider: str = "openai", 

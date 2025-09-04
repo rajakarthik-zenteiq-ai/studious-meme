@@ -10,7 +10,6 @@ RUN apt-get update && apt-get install -y \
     gfortran \
     libblas-dev \
     liblapack-dev \
-    libatlas-base-dev \
     libopenblas-dev \
     curl \
     git \
@@ -24,6 +23,7 @@ RUN pip install --upgrade pip wheel setuptools
 # Copy server code and SciREX repo
 COPY mcp_servers/scirex_server /app/mcp_servers/scirex_server
 COPY config /app/config
+COPY object_storage_s3.py /app/
 
 # Pre-install scientific computing stack from wheels to avoid build issues
 RUN pip install --no-cache-dir --only-binary=all \
@@ -54,21 +54,23 @@ RUN pip install --default-timeout=600 --retries=3 \
 WORKDIR /app
 
 # Create necessary directories
-RUN mkdir -p /app/data /app/logs
+RUN mkdir -p /app/data /app/logs /data/user_datasets /data/user_models
 
-# Create non-root user for security
-RUN useradd -m -u 1000 mcp && chown -R mcp:mcp /app
+# Create non-root user for security and set permissions
+RUN useradd -m -u 1000 mcp && \
+    chown -R mcp:mcp /app && \
+    chown -R mcp:mcp /data
 USER mcp
 
 # Set Python path
 ENV PYTHONPATH=/app:$PYTHONPATH
 
-# Expose port
-EXPOSE 8106
+# Expose port (align with SCIREX_MCP_PORT in compose)
+EXPOSE 8150
 
-# Health check
+# Health check (simple connectivity test)
 HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
-    CMD curl -f http://localhost:8106/health || exit 1
+    CMD curl -f http://localhost:8150/mcp/ -H "Content-Type: application/json" || exit 1
 
 # Run server
 WORKDIR /app/mcp_servers/scirex_server

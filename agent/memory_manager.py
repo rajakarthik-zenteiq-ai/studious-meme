@@ -207,3 +207,67 @@ class MemoryManager:
         if self.mongo_client:
             self.mongo_client.close()
         logger.info("Memory manager connections closed")
+    
+    async def list_user_conversations(
+        self, 
+        user_id: str, 
+        limit: int = 20, 
+        offset: int = 0
+    ) -> List[Dict[str, Any]]:
+        """List all conversations for a user"""
+        try:
+            cursor = self.db.conversations.find(
+                {"user_id": user_id},
+                {"conversation_id": 1, "updated_at": 1, "message_count": 1, "_id": 0}
+            ).sort("updated_at", -1).skip(offset).limit(limit)
+            
+            conversations = await cursor.to_list(length=limit)
+            return conversations
+            
+        except Exception as e:
+            logger.error(f"Error listing conversations for user {user_id}: {e}")
+            return []
+    
+    async def delete_conversation(self, user_id: str, conversation_id: str) -> bool:
+        """Delete a conversation"""
+        try:
+            result = await self.db.conversations.delete_one({
+                "user_id": user_id,
+                "conversation_id": conversation_id
+            })
+            
+            # Also clear from Redis cache
+            cache_key = f"context:{user_id}:{conversation_id}"
+            if self.redis_client:
+                await self.redis_client.delete(cache_key)
+            
+            return result.deleted_count > 0
+            
+        except Exception as e:
+            logger.error(f"Error deleting conversation {conversation_id} for user {user_id}: {e}")
+            return False
+    
+    async def get_conversation_history(
+        self, 
+        user_id: str, 
+        conversation_id: str, 
+        limit: int = 50
+    ) -> List[Dict[str, Any]]:
+        """Get conversation message history"""
+        try:
+            # Get conversation from MongoDB
+            conversation = await self.db.conversations.find_one({
+                "user_id": user_id,
+                "conversation_id": conversation_id
+            })
+            
+            if not conversation:
+                return []
+            
+            # Return recent messages (sliding window)
+            messages = conversation.get("messages", [])
+            return messages[-limit:] if limit > 0 else messages
+            
+        except Exception as e:
+            logger.error(f"Error getting conversation history: {e}")
+            return []

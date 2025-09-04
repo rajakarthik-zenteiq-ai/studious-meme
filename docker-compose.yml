@@ -1,4 +1,3 @@
-
 services:
   mongo:
     image: mongo:7
@@ -28,28 +27,13 @@ services:
       - etcd_data:/etcd
     command: etcd -advertise-client-urls=http://127.0.0.1:2379 -listen-client-urls http://0.0.0.0:2379 --data-dir /etcd
 
-  minio:
-    image: minio/minio:latest
-    container_name: milvus-minio
-    environment:
-      - MINIO_ACCESS_KEY=minioadmin
-      - MINIO_SECRET_KEY=minioadmin
-    ports:
-      - "9004:9000"
-      - "9005:9001"
-    volumes:
-      - minio_data:/data
-    command: server /data --console-address ":9001"
-
   milvus:
     image: milvusdb/milvus:v2.3.4
     container_name: milvus
     depends_on:
       - etcd
-      - minio
     environment:
       - ETCD_ENDPOINTS=etcd:2379
-      - MINIO_ADDRESS=minio:9000
       - COMMON_STORAGETYPE=local
     ports:
       - "19531:19530"
@@ -81,20 +65,34 @@ services:
     container_name: mongo_server
     ports:
       - "8100:8100"
+    env_file:
+      - .env
     environment:
       - IS_DOCKER=true
       - PYTHONUNBUFFERED=1
-      - MONGO_URI=mongodb://admin:password@mongo:27017
+      # Required by config validation inside container
+      - JWT_SECRET=${JWT_SECRET}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URI=mongodb://admin:password@mongo:27017/logsdb?authSource=admin
+      # Service-specific
       - MONGO_DB=logsdb
       - MONGO_MAX_POOL_SIZE=${MONGO_MAX_POOL_SIZE:-10}
       - MONGO_MIN_POOL_SIZE=${MONGO_MIN_POOL_SIZE:-1}
       - DEBUG=${DEBUG:-true}
       - MONGO_MCP_PORT=8100
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL}
+      - AWS_BUCKET_NAME=${AWS_BUCKET_NAME}
+      - SCIREX_DATA_DIR=/data/user_datasets
+      - SCIREX_MODEL_DIR=/data/user_models
     depends_on:
       mongo:
         condition: service_healthy
-      minio:
-        condition: service_started
+    volumes:
+      - ./data_cache:/app/data
+      - scirex_data:/data
     command: ["python", "/app/server.py", "--host", "0.0.0.0", "--port", "8100"]
     restart: unless-stopped
     healthcheck:
@@ -110,9 +108,17 @@ services:
     container_name: milvus_server
     ports:
       - "8110:8110"
+    env_file:
+      - .env
     environment:
       - IS_DOCKER=true
       - PYTHONUNBUFFERED=1
+      # Required by config validation inside container
+      - JWT_SECRET=${JWT_SECRET}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URI=mongodb://admin:password@mongo:27017/logsdb?authSource=admin
+      # Milvus specific
       - MILVUS_HOST=milvus
       - MILVUS_PORT=19530
       - MILVUS_COLLECTION=${MILVUS_COLLECTION:-logs_embeddings}
@@ -135,10 +141,17 @@ services:
     container_name: websearch_server
     ports:
       - "8140:8140"
+    env_file:
+      - .env
     environment:
       - IS_DOCKER=true
       - PYTHONUNBUFFERED=1
+      # Required by config validation inside container
+      - JWT_SECRET=${JWT_SECRET}
       - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URI=mongodb://admin:password@mongo:27017/logsdb?authSource=admin
+      # Service specific
       - SEARCH_MODEL=${SEARCH_MODEL:-gpt-4o-mini}
       - WEBSEARCH_MCP_PORT=8140
       - DEBUG=${DEBUG:-true}
@@ -157,9 +170,17 @@ services:
     container_name: scirex_server
     ports:
       - "8150:8150"
+    env_file:
+      - .env
     environment:
       - IS_DOCKER=true
       - PYTHONUNBUFFERED=1
+      # Required by config validation inside container
+      - JWT_SECRET=${JWT_SECRET}
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - REDIS_URL=redis://redis:6379/0
+      - MONGO_URI=mongodb://admin:password@mongo:27017/logsdb?authSource=admin
+      # Service specific
       - SCIREX_DATA_DIR=/data/user_datasets
       - SCIREX_MODEL_DIR=/data/user_models
       - SCIREX_MCP_PORT=8150
@@ -168,7 +189,6 @@ services:
       - scirex_data:/data
     depends_on:
       - mongo_server
-      - minio
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8150/mcp/", "||", "exit", "1"]
@@ -180,10 +200,7 @@ volumes:
   mongo_data:
   redis_data:
   etcd_data:
-  minio_data:
   milvus_data:
-  neo4j_data:
-  neo4j_logs:
   scirex_data:
 
 networks:

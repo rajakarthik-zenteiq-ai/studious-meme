@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 from mcp_client.main import main as client_main
 from agent.mcp_agent import MCPAgent
 
+
 # Production logging
 logging.basicConfig(level=logging.WARNING)
 
@@ -115,10 +116,13 @@ def main():
     if args.mode == "client":
         asyncio.run(client_main())
     elif args.mode == "agent":
-        agent = create_agent()
+        agent = MCPAgent()
+        # Ensure initialization (defaulting to VIEWER role if not provided)
+        if not getattr(agent, '_initialized', False):
+            from utils.auth_utils import UserRole
+            asyncio.run(agent.initialize(UserRole.VIEWER))
         if args.query:
-            import asyncio
-            result = asyncio.run(agent.analyze(
+            result = asyncio.run(agent.chat(
                 query=args.query,
                 user_id="cli_user",
                 conversation_id="cli_session"

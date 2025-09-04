@@ -14,6 +14,9 @@ COPY mcp_servers/mongo_server/server.py /app/
 COPY mcp_servers/mongo_server/__init__.py /app/
 COPY mcp_servers/mongo_server/oauth_auth.py /app/
 
+# Copy shared dependencies
+COPY object_storage_s3.py /app/
+
 # Copy config directory
 COPY config /app/config/
 
